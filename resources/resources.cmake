@@ -36,12 +36,6 @@ if(NOT LIBRETRO)
             fonts/Roboto-Medium.ttf.zip
             fonts/Roboto-Bold.ttf.zip
             fonts/fa-solid-900.ttf.zip)
-    if(ANDROID OR IOS)
-        cmrc_add_resources(flycast-resources
-                WHENCE resources
-                resources/picture/buttons.png
-                resources/picture/buttons-arcade.png)
-    endif()
 endif()
 
 cmrc_add_resources(flycast-resources fonts/biosfont.bin.zip)

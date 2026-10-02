@@ -1,7 +1,6 @@
 target_sources(${PROJECT_NAME} PRIVATE
         context.cpp
         context.h
-        libretro.h
         switcher.cpp)
 
 if(USE_OPENGL)
@@ -11,8 +10,6 @@ if(USE_OPENGL)
             egl.h
             gl_context.cpp
             gl_context.h
-            osx.cpp
-            osx.h
             sdl.cpp
             sdl.h)
 endif()
