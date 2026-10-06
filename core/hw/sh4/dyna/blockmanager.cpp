@@ -303,37 +303,9 @@ void bm_DiscardBlock(RuntimeBlockInfo* block)
 	block_ptr->Discard();
 }
 
-#ifdef __vita__
-// TELEMETRY (temporary)
-void vita_mem_report(const char *where);
-static u32 tmResets;
-u32 tmCompiles;
-u32 tmPcs[16];
-void bm_report()
-{
-	WARN_LOG(DYNAREC, "TM pcs: %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x",
-			tmPcs[0], tmPcs[1], tmPcs[2], tmPcs[3], tmPcs[4], tmPcs[5], tmPcs[6], tmPcs[7],
-			tmPcs[8], tmPcs[9], tmPcs[10], tmPcs[11], tmPcs[12], tmPcs[13], tmPcs[14], tmPcs[15]);
-	if (p_sh4rcb != nullptr)
-	{
-		WARN_LOG(DYNAREC, "TM sh4 pc %08x pr %08x", p_sh4rcb->cntx.pc, p_sh4rcb->cntx.pr);
-		WARN_LOG(DYNAREC, "TM fpcb rcb %p l1[0] %p l1[0xa00] %p unused %p unused[0] %p handler %p", p_sh4rcb, p_sh4rcb->fpcb[0], p_sh4rcb->fpcb[0xa00], fpcbUnused, fpcbUnused[0], ngen_FailedToFindBlock);
-		void tm_addrspace_dump();
-		if (p_sh4rcb->cntx.pc != 0) tm_addrspace_dump();
-		if (p_sh4rcb->cntx.pc != 0) WARN_LOG(DYNAREC, "TM rom %08x %08x %08x %08x ram %08x %08x %08x %08x", addrspace::read32(0xa0000000), addrspace::read32(0xa0000004),
-				addrspace::read32(0x80000000), addrspace::read32(0x80000004),
-				addrspace::read32(0x8c000000), addrspace::read32(0x8c000004), addrspace::read32(0x8c008000), addrspace::read32(0x8c010000));
-	}
-	WARN_LOG(DYNAREC, "TM bm: compiles %u resets %u blocks %u temp %u del %u", tmCompiles, tmResets, (u32)blkmap.size(), (u32)all_temp_blocks.size(), (u32)del_blocks.size());
-}
-#endif
 
 void bm_Periodical_1s()
 {
-#ifdef __vita__
-	WARN_LOG(DYNAREC, "TM 1s: resets %u blocks %u temp %u del %u", tmResets, (u32)blkmap.size(), (u32)all_temp_blocks.size(), (u32)del_blocks.size());
-	vita_mem_report("1s");
-#endif
 	bm_CleanupDeletedBlocks();
 }
 
@@ -396,16 +368,6 @@ void bm_UnlockPage(u32 addr, u32 size)
 
 void bm_ResetCache()
 {
-#ifdef __vita__
-	vitaTrace[VT_RESETS]++;
-#endif
-#ifdef __vita__
-	if (++tmResets <= 20 || tmResets % 100 == 0)
-	{
-		WARN_LOG(DYNAREC, "TM reset %u: blocks %u del %u", tmResets, (u32)blkmap.size(), (u32)del_blocks.size());
-		vita_mem_report("reset");
-	}
-#endif
 	bm_generation++;
 	sh4Dynarec->reset();
 	addrspace::bm_reset();
@@ -566,11 +528,7 @@ void RuntimeBlockInfo::SetProtectedFlags()
 #ifdef VITA_MEMORY_MODEL
 	// Only the reserved guest address space can be write protected:
 	// otherwise blocks check their code instead
-#ifdef __vita__
-	const bool canProtect = addrspace::virtmemEnabled() && !vitaNoProtect;
-#else
 	const bool canProtect = addrspace::virtmemEnabled();
-#endif
 #else
 	constexpr bool canProtect = true;
 #endif

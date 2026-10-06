@@ -1,6 +1,7 @@
 #include "glcache.h"
 #include "gles.h"
 #include "hw/pvr/pvr_mem.h"
+#include "hw/mem/addrspace.h"
 
 #include <memory>
 
@@ -231,6 +232,11 @@ void ReadRTTBuffer()
 		u32 linestride = gl.rendContext->fb_W_LINESTRIDE * 8;
 		if (linestride == 0)
 			linestride = w * 2;
+#ifdef VITA_MEMORY_MODEL
+		// No hardware write protection: invalidate the textures in the written range
+		if (w != 0 && h != 0)
+			addrspace::vramLockedWrite(tex_addr, (h - 1) * linestride + w * 2);
+#endif
 
 		GLint color_fmt, color_type;
 		glGetIntegerv(GL_IMPLEMENTATION_COLOR_READ_FORMAT, &color_fmt);

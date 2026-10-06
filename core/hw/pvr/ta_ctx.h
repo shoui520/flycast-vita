@@ -6,6 +6,7 @@
 #include <glm/glm.hpp>
 
 #include <algorithm>
+#include <cstring>
 #include <vector>
 
 // Leaves new elements uninitialized on resize()
@@ -313,7 +314,9 @@ struct rend_context
 		// Reserve space for background poly
 		global_param_op.emplace_back();
 		global_param_op.back().init();
+		// verts doesn't initialize new elements: FillBGP() doesn't set all the fields
 		verts.resize(4);
+		memset(verts.data(), 0, 4 * sizeof(Vertex));
 
 		fZ_max = 1.0f;
 		matrices.clear();

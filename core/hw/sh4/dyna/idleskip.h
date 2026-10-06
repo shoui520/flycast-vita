@@ -16,6 +16,9 @@ struct RuntimeBlockInfo;
 // Block can be part of a skippable loop: no memory writes, store queue
 // flushes, interpreter fallbacks, SR updates or interrupt checks
 bool idleskip_blockPure(RuntimeBlockInfo *block);
+// Block that is only impure because it writes memory: idle-skip probes can
+// interpret it. Must be called before the block's IR is discarded.
+bool idleskip_blockInterpretable(RuntimeBlockInfo *block);
 
 // Called by the dynarec when the cycle counter is negative at a block start.
 // pcFlag: block pc | 1 if the block is pure. Returns IdleSkipAction.

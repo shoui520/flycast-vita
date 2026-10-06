@@ -97,16 +97,6 @@ static float fmaf_helper(float a, float b, float c)
 }
 #endif
 
-// TELEMETRY (temporary): bisect switch
-static bool fastmemEnabled()
-{
-#ifdef __vita__
-	return addrspace::virtmemEnabled() && !vitaNoFastmem;
-#else
-	return addrspace::virtmemEnabled();
-#endif
-}
-
 #define rcbOffset(x) (-sizeof(Sh4RCB) + offsetof(Sh4RCB, x))
 #define ctxOffset(x) (-sizeof(Sh4Context) + offsetof(Sh4Context, x))
 
@@ -1291,7 +1281,7 @@ void Arm32Assembler::compileOp(RuntimeBlockInfo* block, shil_opcode* op, bool op
 				Register raddr = GenMemAddr(op);
 				genMmuLookup(block, *op, 0, raddr);
 
-				if (fastmemEnabled()) {
+				if (addrspace::virtmemEnabled()) {
 					Bic(r1, raddr, optp == SZ_32F || optp == SZ_64F ? 0xE0000003 : 0xE0000000);
 
 					switch(optp)
@@ -1410,10 +1400,16 @@ void Arm32Assembler::compileOp(RuntimeBlockInfo* block, shil_opcode* op, bool op
 						&& op->rs1._reg <= reg_r15 && (sh4ctx.r[op->rs1._reg] >> 26) == 0x38;
 				if (sqHint)
 				{
-					// aligned SQ address (unaligned ones take the regular path)
+					// aligned SQ address (unaligned ones take the regular path).
+					// 64-bit stores must be 8-byte aligned to stay inside sq_buffer.
 					And(r1, raddr, 0xFC000003);
 					Cmp(r1, 0xE0000000);
 					B(ne, &notSq);
+					if (optp == SZ_64F)
+					{
+						Tst(raddr, 4);
+						B(ne, &notSq);
+					}
 					And(r1, raddr, 0x3F);
 					Add(r1, r1, r8);
 					const int sqOffset = getRegOffset(reg_sq_buffer) - sizeof(Sh4Context);
@@ -1426,7 +1422,7 @@ void Arm32Assembler::compileOp(RuntimeBlockInfo* block, shil_opcode* op, bool op
 					B(&storeDone);
 					Bind(&notSq);
 				}
-				if (fastmemEnabled())
+				if (addrspace::virtmemEnabled())
 				{
 					Bic(r1, raddr, optp == SZ_32F || optp == SZ_64F ? 0xE0000003 : 0xE0000000);
 
@@ -1891,7 +1887,7 @@ void Arm32Assembler::compileOp(RuntimeBlockInfo* block, shil_opcode* op, bool op
 					Register rn = reg.mapReg(op->rs1);
 					Lsr(r1, rn, 26);
 					Cmp(r1, 0x38);
-					if (!mmu_enabled() && fastmemEnabled())
+					if (!mmu_enabled() && addrspace::virtmemEnabled())
 					{
 						// Anything else is a cache prefetch: let the A9 prefetch it too
 						B(ne, &notSq);

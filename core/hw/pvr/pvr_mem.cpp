@@ -10,6 +10,7 @@
 #include "hw/holly/sb.h"
 #include "hw/holly/holly_intc.h"
 #include "serialize.h"
+#include "hw/mem/addrspace.h"
 
 static u32 pvr_map32(u32 offset32);
 
@@ -100,6 +101,11 @@ static void YUV_ConvertMacroBlock(const u8 *datap)
 	//do shit
 	TA_YUV_TEX_CNT++;
 
+#ifdef VITA_MEMORY_MODEL
+	// 16 lines of 16 pixels
+	for (u32 y = 0; y < 16; y++)
+		addrspace::vramWrite(YUV_dest + y * YUV_x_size * 2, 32);
+#endif
 	YUV_Block384(datap, &vram[YUV_dest]);
 
 	YUV_dest+=32;
@@ -230,6 +236,9 @@ void DYNACALL pvr_write32p(u32 addr, T data)
 	if (vaddr >= fb_watch_addr_start && vaddr < fb_watch_addr_end)
 		fb_dirty = true;
 
+#ifdef VITA_MEMORY_MODEL
+	addrspace::vramWrite(pvr_map32(addr), sizeof(T));
+#endif
 	*(T *)&vram[pvr_map32(addr)] = data;
 }
 template void pvr_write32p<u8, false>(u32 addr, u8 data);
@@ -270,6 +279,9 @@ void DYNACALL TAWriteSQ(u32 address, const SQBuffer *sqb)
 		if (path64b)
 		{
 			// 64b path
+#ifdef VITA_MEMORY_MODEL
+			addrspace::vramWrite(address_w, sizeof(SQBuffer));
+#endif
 			SQBuffer *dest = (SQBuffer *)&vram[address_w & VRAM_MASK];
 			*dest = *sq;
 		}
@@ -281,6 +293,28 @@ void DYNACALL TAWriteSQ(u32 address, const SQBuffer *sqb)
 		}
 	}
 }
+
+#ifdef VITA_MEMORY_MODEL
+// Area 1 64-bit path: writes check the texture pages
+template<typename T>
+T DYNACALL pvr_read64p(u32 addr)
+{
+	return *(T *)&vram[addr & VRAM_MASK];
+}
+template u8 pvr_read64p<u8>(u32 addr);
+template u16 pvr_read64p<u16>(u32 addr);
+template u32 pvr_read64p<u32>(u32 addr);
+
+template<typename T>
+void DYNACALL pvr_write64p(u32 addr, T data)
+{
+	addrspace::vramWrite(addr, sizeof(T));
+	*(T *)&vram[addr & VRAM_MASK] = data;
+}
+template void pvr_write64p<u8>(u32 addr, u8 data);
+template void pvr_write64p<u16>(u32 addr, u16 data);
+template void pvr_write64p<u32>(u32 addr, u32 data);
+#endif
 
 //Misc interface
 
@@ -326,7 +360,12 @@ void DYNACALL pvr_write_area4(u32 addr, T data)
 	if (access32)
 		pvr_write32p(addr, data);
 	else
+	{
+#ifdef VITA_MEMORY_MODEL
+		addrspace::vramWrite(addr, sizeof(T));
+#endif
 		*(T*)&vram[addr & VRAM_MASK] = data;
+	}
 }
 template void pvr_write_area4<u8, false>(u32 addr, u8 data);
 template void pvr_write_area4<u16, false>(u32 addr, u16 data);

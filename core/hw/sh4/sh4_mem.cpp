@@ -34,10 +34,16 @@ WriteMem64Func WriteMem64;
 
 //AREA 1
 static addrspace::handler area1_32b;
+#ifdef VITA_MEMORY_MODEL
+static addrspace::handler area1_64b;
+#endif
 
 static void map_area1_init()
 {
 	area1_32b = addrspaceRegisterHandlerTemplate(pvr_read32p, pvr_write32p);
+#ifdef VITA_MEMORY_MODEL
+	area1_64b = addrspaceRegisterHandlerTemplate(pvr_read64p, pvr_write64p);
+#endif
 }
 
 static void map_area1(u32 base)
@@ -46,7 +52,12 @@ static void map_area1(u32 base)
 	
 	//Lower 32 mb map
 	//64b interface
+#ifdef VITA_MEMORY_MODEL
+	// VRAM writes check the texture pages (see addrspace::vramWrite)
+	addrspace::mapHandler(area1_64b, 0x04 | base, 0x04 | base);
+#else
 	addrspace::mapBlock(&vram[0], 0x04 | base, 0x04 | base, VRAM_MASK);
+#endif
 	//32b interface
 	addrspace::mapHandler(area1_32b, 0x05 | base, 0x05 | base);
 	

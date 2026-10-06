@@ -7,6 +7,7 @@
 #include "hw/sh4/sh4_mem.h"
 #include "oslib/oslib.h"
 #include "oslib/virtmem.h"
+#include "rend/TexCache.h"
 #include <cassert>
 
 namespace addrspace
@@ -400,7 +401,11 @@ bool reserve()
 	if (ram_base != nullptr)
 		return true;
 
+#ifndef VITA_MEMORY_MODEL
+	// The Vita memory model doesn't use a reserved guest address space: guest
+	// memory is accessed through the memory handlers
 	virtmem::init((void**)&ram_base, (void**)&p_sh4rcb, RAM_SIZE_MAX + VRAM_SIZE_MAX + ARAM_SIZE_MAX + elan::ERAM_SIZE_MAX);
+#endif
 #ifdef FPCB_L1_SIZE
 	if (ram_base != nullptr)
 		// The memory isn't necessarily zeroed. Null first-level entries are
@@ -412,6 +417,9 @@ bool reserve()
 
 static void termMappings()
 {
+#ifdef VITA_MEMORY_MODEL
+	memset(vramLockedPages, 0, sizeof(vramLockedPages));
+#endif
 	if (ram_base == nullptr)
 	{
 		mem_b.free();
@@ -515,8 +523,30 @@ void release()
 	}
 }
 
+#ifdef VITA_MEMORY_MODEL
+u8 vramLockedPages[VRAM_SIZE_MAX / PAGE_SIZE];
+
+static void setVramLocked(u32 addr, u32 size, u8 locked)
+{
+	addr &= VRAM_MASK;
+	for (u32 offset = addr & ~PAGE_MASK; offset < addr + size; offset += PAGE_SIZE)
+		vramLockedPages[(offset & VRAM_MASK) / PAGE_SIZE] = locked;
+}
+
+void vramLockedWrite(u32 offset, u32 size)
+{
+	for (u32 page = offset & ~PAGE_MASK; page < offset + size; page += PAGE_SIZE)
+		if (vramLockedPages[(page & VRAM_MASK) / PAGE_SIZE] != 0)
+			VramLockedWriteOffset(page & VRAM_MASK);
+}
+#endif
+
 void protectVram(u32 addr, u32 size)
 {
+#ifdef VITA_MEMORY_MODEL
+	setVramLocked(addr, size, 1);
+	return;
+#endif
 	addr &= VRAM_MASK;
 #ifndef __SWITCH__
 	if (virtmemEnabled())
@@ -539,6 +569,10 @@ void protectVram(u32 addr, u32 size)
 
 void unprotectVram(u32 addr, u32 size)
 {
+#ifdef VITA_MEMORY_MODEL
+	setVramLocked(addr, size, 0);
+	return;
+#endif
 	addr &= VRAM_MASK;
 #ifndef __SWITCH__
 	if (virtmemEnabled())
@@ -599,12 +633,3 @@ void getAddress(void** out_ram_base, void** out_ram, void** out_vram, void** out
 
 } // namespace addrspace
 
-#ifdef __vita__
-// TELEMETRY (temporary)
-void tm_addrspace_dump()
-{
-	using namespace addrspace;
-	WARN_LOG(VMEM, "TM memInfo 0c %p 8c %p ac %p 00 %p 80 %p a0 %p mem_b %p", memInfo_ptr[0x0c], memInfo_ptr[0x8c], memInfo_ptr[0xac],
-			memInfo_ptr[0x00], memInfo_ptr[0x80], memInfo_ptr[0xa0], &mem_b[0]);
-}
-#endif

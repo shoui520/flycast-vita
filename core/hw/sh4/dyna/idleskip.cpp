@@ -66,11 +66,9 @@ bool idleskip_blockPure(RuntimeBlockInfo *block)
 	return true;
 }
 
-namespace {
-
 // Blocks that are only impure because they write memory are interpreted while
 // probing. These are the operations the interpreter and the dynarec do alike.
-bool interpretable(RuntimeBlockInfo *block)
+bool idleskip_blockInterpretable(RuntimeBlockInfo *block)
 {
 	if (block->has_fpu_op || block->BlockType == BET_StaticIntr || block->BlockType == BET_DynamicIntr)
 		return false;
@@ -122,6 +120,8 @@ bool interpretable(RuntimeBlockInfo *block)
 	}
 	return true;
 }
+
+namespace {
 
 // Register file compared between two rounds: everything a block can read or
 // write, up to (not including) the dynarec and scheduler state
@@ -262,9 +262,8 @@ u32 skipSingleBranchTarget(u32 addr, u32 vaddr, u32 guestOpcodes)
 {
 	if (ReadMem32 != &addrspace::read32 || WriteMem32 != &addrspace::write32 || block->vaddr != ctx.pc)
 		return false;
-	if (block->idleskipInterpretable < 0)
-		block->idleskipInterpretable = interpretable(block);
-	if (!block->idleskipInterpretable)
+	// set when the block is compiled
+	if (block->idleskipInterpretable != 1)
 		return false;
 	blockStart = block->vaddr;
 	blockEnd = blockStart + block->sh4_code_size;

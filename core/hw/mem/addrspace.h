@@ -1,5 +1,8 @@
 #pragma once
 #include "types.h"
+#ifdef VITA_MEMORY_MODEL
+#include "stdclass.h"
+#endif
 
 namespace addrspace
 {
@@ -78,6 +81,19 @@ void bm_reset(); // FIXME rename? move?
 bool bm_lockedWrite(u8* address); // FIXME rename?
 
 void protectVram(u32 addr, u32 size);
+#ifdef VITA_MEMORY_MODEL
+// No hardware write protection: texture pages in VRAM are tracked in software.
+// Every host write to VRAM calls vramWrite() (or vramLockedWrite()) first.
+extern u8 vramLockedPages[VRAM_SIZE_MAX / PAGE_SIZE];
+void vramLockedWrite(u32 offset, u32 size);
+// size <= PAGE_SIZE
+static inline void vramWrite(u32 offset, u32 size)
+{
+	offset &= VRAM_MASK;
+	if ((vramLockedPages[offset / PAGE_SIZE] | vramLockedPages[((offset + size - 1) & VRAM_MASK) / PAGE_SIZE]) != 0)
+		vramLockedWrite(offset, size);
+}
+#endif
 void unprotectVram(u32 addr, u32 size);
 u32 getVramOffset(void *addr);
 void getAddress(void** out_ram_base, void** out_ram, void** out_vram, void** out_aica);
