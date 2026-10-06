@@ -45,6 +45,7 @@ using namespace vixl::aarch32;
 #include "hw/sh4/sh4_interrupts.h"
 #include "hw/sh4/sh4_core.h"
 #include "hw/sh4/dyna/ngen.h"
+#include "hw/sh4/dyna/idleskip.h"
 #include "hw/sh4/dyna/ssa_regalloc.h"
 #include "hw/sh4/sh4_mem.h"
 #include "cfg/option.h"
@@ -89,6 +90,23 @@ extern "C" char *stpcpy(char *dst, char const *src)
 }
 #endif
 
+#ifndef __ARM_FEATURE_FMA
+static float fmaf_helper(float a, float b, float c)
+{
+	return std::fma(a, b, c);
+}
+#endif
+
+// TELEMETRY (temporary): bisect switch
+static bool fastmemEnabled()
+{
+#ifdef __vita__
+	return addrspace::virtmemEnabled() && !vitaNoFastmem;
+#else
+	return addrspace::virtmemEnabled();
+#endif
+}
+
 #define rcbOffset(x) (-sizeof(Sh4RCB) + offsetof(Sh4RCB, x))
 #define ctxOffset(x) (-sizeof(Sh4Context) + offsetof(Sh4Context, x))
 
@@ -108,10 +126,17 @@ static std::map<shilop, ConditionType> ccnmap;
 
 static const void *no_update;
 static const void *intc_sched;
+// intc_sched with the block's pc | pure flag read from the word before the
+// block, for a prologue that starts at block offset 4 * index
+static constexpr int SchedLitStubs = 32;
+static const void *intc_sched_lit[SchedLitStubs];
 static const void *ngen_blockcheckfail;
 static const void *ngen_LinkBlock_Generic_stub;
 static const void *ngen_LinkBlock_cond_Branch_stub;
 static const void *ngen_LinkBlock_cond_Next_stub;
+// Unlinked block exits (CPU stopping): leave through no_update with the next pc
+static const void *ngen_ExitBlock_Branch_stub;
+static const void *ngen_ExitBlock_Next_stub;
 static void (*ngen_FailedToFindBlock_)();
 static void (*mainloop)(void *);
 static void (*handleException)();
@@ -199,7 +224,7 @@ public:
 		verify((offset & 3) == 0);
 		if (offset < -32 * 1024 * 1024 || offset >= 32 * 1024 * 1024)
 		{
-			WARN_LOG(DYNAREC, "jump offset too large: %d", offset);
+			INFO_LOG(DYNAREC, "jump offset too large: %d", offset);
 			UseScratchRegisterScope scope(this);
 			Register reg = scope.Acquire();
 			Mov(cond, reg, (u32)code);
@@ -218,7 +243,7 @@ public:
 		verify((offset & 3) == 0);
 		if (offset < -32 * 1024 * 1024 || offset >= 32 * 1024 * 1024)
 		{
-			WARN_LOG(DYNAREC, "call offset too large: %d", offset);
+			INFO_LOG(DYNAREC, "call offset too large: %d", offset);
 			UseScratchRegisterScope scope(this);
 			Register reg = scope.Acquire();
 			Mov(cond, reg, (u32)code);
@@ -287,10 +312,11 @@ public:
 					jump((void *)block->pNextBlock->code);
 				else
 					call(ngen_LinkBlock_cond_Next_stub);
-				nop();
-				nop();
-				nop();
-				nop();
+			}
+			else if (!mmu_enabled())
+			{
+				call(ngen_ExitBlock_Branch_stub, CC);
+				call(ngen_ExitBlock_Next_stub);
 			}
 			else
 			{
@@ -313,7 +339,13 @@ public:
 			if (!mmu_enabled() && sh4ctx.CpuRunning)
 			{
 				sub(r2, r8, -rcbOffset(fpcb));
+#ifdef FPCB_L1_SIZE
+				ubfx(r1, r4, FPCB_L2_BITS + 1, 24 - FPCB_L2_BITS);
+				ldr(r2, MemOperand(r2, r1, LSL, 2));
+				ubfx(r1, r4, 1, FPCB_L2_BITS);
+#else
 				ubfx(r1, r4, 1, 24);
+#endif
 				ldr(pc, MemOperand(r2, r1, LSL, 2));
 			}
 			else
@@ -321,6 +353,11 @@ public:
 				storeSh4Reg(r4, reg_nextpc);
 				jump(no_update);
 				nop();
+#ifdef FPCB_L1_SIZE
+				// Same size as above
+				nop();
+				nop();
+#endif
 			}
 			break;
 
@@ -332,9 +369,10 @@ public:
 					call(ngen_LinkBlock_Generic_stub);
 				else
 					call((void *)block->pBranchBlock->code);
-				nop();
-				nop();
-				nop();
+			}
+			else if (!mmu_enabled())
+			{
+				call(ngen_ExitBlock_Branch_stub);
 			}
 			else
 			{
@@ -452,6 +490,12 @@ public:
 	}
 
 	void compile(RuntimeBlockInfo* block, bool smc_check, bool optimise) override {
+		if (!mmu_enabled() && !smc_check)
+		{
+			// read by intc_sched_lit
+			*(u32 *)codeBuffer->get() = block->vaddr | (idleskip_blockPure(block) ? 1 : 0);
+			codeBuffer->advance(4);
+		}
 		ass = new Arm32Assembler(*sh4ctx, *codeBuffer);
 		ass->compile(block, smc_check, optimise);
 		delete ass;
@@ -709,6 +753,9 @@ const void * const _mem_func[2][2] =
 	{ (void *)addrspace::write32, (void *)addrspace::write64 },
 	{ (void *)addrspace::read32, (void *)addrspace::read64 },
 };
+// _mem_func entries in the code buffer: calls from rewritten memory accesses
+// must be a single bl
+static const void *_mem_func_near[2][2];
 
 void Arm32Assembler::vmem_slowpath(Register raddr, Register rt, SRegister ft, DRegister fd, mem_op_type optp, bool read)
 {
@@ -931,7 +978,7 @@ void Arm32Assembler::rewrite(Register raddr, Register rt, SRegister ft, DRegiste
 		const void *funct;
 
 		if (optp >= SZ_32F)
-			funct = _mem_func[!write][optp - SZ_32F];
+			funct = _mem_func_near[!write][optp - SZ_32F];
 		else
 			funct = _mem_hndl[!write][optp][raddr.GetCode()];
 
@@ -948,6 +995,8 @@ void Arm32Assembler::rewrite(Register raddr, Register rt, SRegister ft, DRegiste
 		}
 	}
 
+	// the rewritten access is 3 instructions
+	verify(GetCursorOffset() <= 12);
 	Finalize();
 }
 
@@ -1242,7 +1291,7 @@ void Arm32Assembler::compileOp(RuntimeBlockInfo* block, shil_opcode* op, bool op
 				Register raddr = GenMemAddr(op);
 				genMmuLookup(block, *op, 0, raddr);
 
-				if (addrspace::virtmemEnabled()) {
+				if (fastmemEnabled()) {
 					Bic(r1, raddr, optp == SZ_32F || optp == SZ_64F ? 0xE0000003 : 0xE0000000);
 
 					switch(optp)
@@ -1269,9 +1318,8 @@ void Arm32Assembler::compileOp(RuntimeBlockInfo* block, shil_opcode* op, bool op
 						Vldr(d0, MemOperand(r1));
 						if (reg.IsAllocf(op->rd))
 						{
-							Vmov(r0, r1, d0);
-							Vmov(reg.mapFReg(op->rd, 0), r0);
-							Vmov(reg.mapFReg(op->rd, 1), r1);
+							Vmov(reg.mapFReg(op->rd, 0), s0);
+							Vmov(reg.mapFReg(op->rd, 1), s1);
 							// easier to do just this but we need to use a different op than 32f to distinguish during rewrite
 							//Vldr(reg.mapFReg(op->rd, 0), MemOperand(r1));
 							//Vldr(reg.mapFReg(op->rd, 1), MemOperand(r1, 4));
@@ -1305,9 +1353,8 @@ void Arm32Assembler::compileOp(RuntimeBlockInfo* block, shil_opcode* op, bool op
 						vmem_slowpath(raddr, r0, s0, d0, optp, true);
 						if (reg.IsAllocf(op->rd))
 						{
-							Vmov(r0, r1, d0);
-							Vmov(reg.mapFReg(op->rd, 0), r0);
-							Vmov(reg.mapFReg(op->rd, 1), r1);
+							Vmov(reg.mapFReg(op->rd, 0), s0);
+							Vmov(reg.mapFReg(op->rd, 1), s1);
 						}
 						else
 						{
@@ -1334,9 +1381,8 @@ void Arm32Assembler::compileOp(RuntimeBlockInfo* block, shil_opcode* op, bool op
 				{
 					if (reg.IsAllocf(op->rs2))
 					{
-						Vmov(r2, reg.mapFReg(op->rs2, 0));
-						Vmov(r3, reg.mapFReg(op->rs2, 1));
-						Vmov(d0, r2, r3);
+						Vmov(s0, reg.mapFReg(op->rs2, 0));
+						Vmov(s1, reg.mapFReg(op->rs2, 1));
 					}
 					else
 					{
@@ -1356,7 +1402,31 @@ void Arm32Assembler::compileOp(RuntimeBlockInfo* block, shil_opcode* op, bool op
 					else
 						rs2 = reg.mapReg(op->rs2);
 				}
-				if (addrspace::virtmemEnabled())
+				// Store queue writers (vertex submission loops): the base register points to the SQ
+				// area when the block is compiled. Store into sq_buffer inline, without a call and,
+				// for FP values, without waiting for the FPU result to move it to a core register.
+				Label notSq, storeDone;
+				const bool sqHint = !mmu_enabled() && optp >= SZ_32I && op->rs1.is_reg()
+						&& op->rs1._reg <= reg_r15 && (sh4ctx.r[op->rs1._reg] >> 26) == 0x38;
+				if (sqHint)
+				{
+					// aligned SQ address (unaligned ones take the regular path)
+					And(r1, raddr, 0xFC000003);
+					Cmp(r1, 0xE0000000);
+					B(ne, &notSq);
+					And(r1, raddr, 0x3F);
+					Add(r1, r1, r8);
+					const int sqOffset = getRegOffset(reg_sq_buffer) - sizeof(Sh4Context);
+					if (optp == SZ_32I)
+						Str(rs2, MemOperand(r1, sqOffset));
+					else if (optp == SZ_32F)
+						Vstr(rs2f, MemOperand(r1, sqOffset));
+					else
+						Vstr(d0, MemOperand(r1, sqOffset));
+					B(&storeDone);
+					Bind(&notSq);
+				}
+				if (fastmemEnabled())
 				{
 					Bic(r1, raddr, optp == SZ_32F || optp == SZ_64F ? 0xE0000003 : 0xE0000000);
 
@@ -1408,6 +1478,8 @@ void Arm32Assembler::compileOp(RuntimeBlockInfo* block, shil_opcode* op, bool op
 						break;
 					}
 				}
+				if (sqHint)
+					Bind(&storeDone);
 			}
 			break;
 
@@ -1813,11 +1885,19 @@ void Arm32Assembler::compileOp(RuntimeBlockInfo* block, shil_opcode* op, bool op
 		case shop_pref:
 			{
 				ConditionType cc = eq;
+				Label notSq;
 				if (!op->rs1.is_imm())
 				{
-					Lsr(r1, reg.mapReg(op->rs1), 26);
-					Mov(r0, reg.mapReg(op->rs1));
+					Register rn = reg.mapReg(op->rs1);
+					Lsr(r1, rn, 26);
 					Cmp(r1, 0x38);
+					if (!mmu_enabled() && fastmemEnabled())
+					{
+						// Anything else is a cache prefetch: let the A9 prefetch it too
+						B(ne, &notSq);
+						cc = al;
+					}
+					Mov(r0, rn);
 				}
 				else
 				{
@@ -1837,6 +1917,15 @@ void Arm32Assembler::compileOp(RuntimeBlockInfo* block, shil_opcode* op, bool op
 				{
 					Ldr(r2, MemOperand(r8, ctxOffset(doSqWrite)));
 					Blx(cc, r2);
+				}
+				if (notSq.IsReferenced())
+				{
+					Label done;
+					B(&done);
+					Bind(&notSq);
+					Bic(r1, reg.mapReg(op->rs1), 0xE0000000);
+					Pld(MemOperand(r1, r8));
+					Bind(&done);
 				}
 			}
 			break;
@@ -1954,9 +2043,45 @@ void Arm32Assembler::compileOp(RuntimeBlockInfo* block, shil_opcode* op, bool op
 						rs3 = s3;
 					}
 				}
+#ifdef __ARM_FEATURE_FMA
 				if (!rd.Is(rs1))
 					Vmov(rd, rs1);
 				Vfma(rd, rs2, rs3);
+#else
+				// No fused multiply-add before VFPv4 (Cortex-A9).
+				// The product of two floats is exact in double precision, so
+				// rounding the double sum to single precision gives fmaf()
+				// unless the sum is exactly halfway between two floats (double
+				// rounding) or in the subnormal range: these go to fmaf().
+				Vcvt(F64, F32, d16, rs1);
+				Vcvt(F64, F32, d17, rs2);
+				Vcvt(F64, F32, d18, rs3);
+				Vmul(F64, d17, d17, d18);
+				Vadd(F64, d16, d17, d16);
+				Vmov(r0, r1, d16);
+				Label slowPath;
+				Label done;
+				Ubfx(r2, r1, 20, 11);
+				Sub(r2, r2, 1);
+				// 912 (encodable) instead of 1023 - 126: a few more tiny sums take the exact path
+				Cmp(r2, 912);
+				B(ls, &slowPath);
+				Lsl(r3, r0, 3);
+				Cmp(r3, 0x80000000);
+				B(eq, &slowPath);
+				Vcvt(F32, F64, rd, d16);
+				B(&done);
+				Bind(&slowPath);
+				Vmov(s4, rs1);
+				Vmov(s5, rs2);
+				Vmov(s6, rs3);
+				Vmov(s0, s5);
+				Vmov(s1, s6);
+				Vmov(s2, s4);
+				call((void *)fmaf_helper);
+				Vmov(rd, s0);
+				Bind(&done);
+#endif
 			}
 			break;
 
@@ -2110,6 +2235,65 @@ void Arm32Assembler::compileOp(RuntimeBlockInfo* block, shil_opcode* op, bool op
 			}
 			break;
 			*/
+		// Same operations as the canonical implementations (exact products and
+		// sums in double precision, one rounding to single precision at the end),
+		// using d16-d31 which the register allocator doesn't use
+		case shop_fipr:
+			{
+				Sub(r0, r8, -op->rs1.reg_nofs());
+				Vldm(r0, NO_WRITE_BACK, DRegisterList(d0, 2));
+				Vcvt(F64, F32, d16, s0);
+				Vcvt(F64, F32, d17, s1);
+				Vcvt(F64, F32, d18, s2);
+				Vcvt(F64, F32, d19, s3);
+				int m = 16;
+				if (op->rs2.reg_nofs() != op->rs1.reg_nofs())
+				{
+					Sub(r1, r8, -op->rs2.reg_nofs());
+					Vldm(r1, NO_WRITE_BACK, DRegisterList(d0, 2));
+					Vcvt(F64, F32, d20, s0);
+					Vcvt(F64, F32, d21, s1);
+					Vcvt(F64, F32, d22, s2);
+					Vcvt(F64, F32, d23, s3);
+					m = 20;
+				}
+				Vmul(F64, d24, d16, DRegister(m));
+				Vmla(F64, d24, d17, DRegister(m + 1));
+				Vmla(F64, d24, d18, DRegister(m + 2));
+				Vmla(F64, d24, d19, DRegister(m + 3));
+				Vcvt(F32, F64, reg.mapFReg(op->rd), d24);
+			}
+			break;
+
+		case shop_ftrv:
+			{
+				// fd[i] = fn[0] * fm[i] + fn[1] * fm[4 + i] + fn[2] * fm[8 + i] + fn[3] * fm[12 + i]
+				Sub(r1, r8, -op->rs1.reg_nofs());
+				Sub(r2, r8, -op->rs2.reg_nofs());
+				Vldm(r1, NO_WRITE_BACK, DRegisterList(d0, 2));
+				Vldm(r2, WRITE_BACK, SRegisterList(s4, 12));
+				for (int i = 0; i < 4; i++)
+					Vcvt(F64, F32, DRegister(16 + i), SRegister(i));
+				for (int i = 0; i < 12; i++)
+					Vcvt(F64, F32, DRegister(20 + i), SRegister(4 + i));
+				Vldm(r2, NO_WRITE_BACK, SRegisterList(SRegister(8), 4));
+				for (int i = 0; i < 4; i++)
+					Vmul(F64, DRegister(i), DRegister(20 + i), d16);
+				for (int i = 0; i < 4; i++)
+					Vmla(F64, DRegister(i), DRegister(24 + i), d17);
+				for (int i = 0; i < 4; i++)
+					Vcvt(F64, F32, DRegister(20 + i), SRegister(8 + i));
+				for (int i = 0; i < 4; i++)
+					Vmla(F64, DRegister(i), DRegister(28 + i), d18);
+				for (int i = 0; i < 4; i++)
+					Vmla(F64, DRegister(i), DRegister(20 + i), d19);
+				for (int i = 0; i < 4; i++)
+					Vcvt(F32, F64, SRegister(8 + i), DRegister(i));
+				Sub(r0, r8, -op->rd.reg_nofs());
+				Vstm(r0, NO_WRITE_BACK, SRegisterList(SRegister(8), 4));
+			}
+			break;
+
 		case shop_frswap:
 			Sub(r0, r8, -op->rs1.reg_nofs());
 			Sub(r1, r8, -op->rd.reg_nofs());
@@ -2221,14 +2405,24 @@ void Arm32Assembler::compile(RuntimeBlockInfo* block, bool force_checks, bool op
 	}
 
 	//scheduler
+	const u32 schedOffset = GetCursorOffset();
 	Ldr(r1, MemOperand(r8, ctxOffset(cycle_counter)));
 	Cmp(r1, 0);
-	Label cyclesRemaining;
-	B(pl, &cyclesRemaining);
-	Mov(r0, block->vaddr);
-	call(intc_sched);
-	Mov(r1, r0);
-	Bind(&cyclesRemaining);
+	if (!mmu_enabled() && !force_checks && schedOffset / 4 < (u32)SchedLitStubs)
+	{
+		// no pc to load: keeps the cold path out of the block
+		call(intc_sched_lit[schedOffset / 4], mi);
+		verify((u32)GetCursorOffset() == schedOffset + 12);
+	}
+	else
+	{
+		Label cyclesRemaining;
+		B(pl, &cyclesRemaining);
+		// bit 0 tells idleskip_sched that the block has no side effects
+		Mov(r0, block->vaddr | (idleskip_blockPure(block) ? 1 : 0));
+		call(intc_sched);
+		Bind(&cyclesRemaining);
+	}
 	const u32 cycles = block->guest_cycles;
 	if (!ImmediateA32::IsImmediateA32(cycles))
 	{
@@ -2312,6 +2506,20 @@ void Arm32Dynarec::generate_mainloop()
 	ass.genMainLoop();
 }
 
+// Next pc of an unlinked static or conditional block exit
+static u32 DYNACALL exitBlockPc(u8 *code, u32 branch)
+{
+	RuntimeBlockInfoPtr rbi = bm_GetBlock(code);
+	if (!rbi)
+		rbi = bm_GetStaleBlock(code);
+	verify(rbi != nullptr);
+	if (BET_GET_CLS(rbi->BlockType) == BET_CLS_COND && !branch)
+		Sh4cntx.pc = rbi->NextBlock;
+	else
+		Sh4cntx.pc = rbi->BranchBlock;
+	return Sh4cntx.pc;
+}
+
 void Arm32Assembler::genMainLoop()
 {
 	unwinder.start(GetCursorAddress<void *>());
@@ -2363,6 +2571,18 @@ void Arm32Assembler::genMainLoop()
 
 	// Main loop
 	Label no_updateLabel;
+// ngen_ExitBlock_Branch_stub, ngen_ExitBlock_Next_stub
+	Label exitBlockShared;
+	ngen_ExitBlock_Branch_stub = GetCursorAddress<const void *>();
+	Mov(r1, 1);
+	B(&exitBlockShared);
+	ngen_ExitBlock_Next_stub = GetCursorAddress<const void *>();
+	Mov(r1, 0);
+	Bind(&exitBlockShared);
+	Sub(r0, lr, 4);		// go before the call
+	call((void *)exitBlockPc);
+	Mov(r4, r0);
+	B(&no_updateLabel);
 // mainloop:
 	::mainloop = GetCursorAddress<void (*)(void *)>();
 	RegisterList savedRegisters = RegisterList::Union(
@@ -2412,20 +2632,26 @@ void Arm32Assembler::genMainLoop()
 	// this code is here for fall-through behavior of do_iter
 	Label do_iter;
 	Label cleanup;
-// intc_sched: r0 is pc, r1 is cycle_counter
+// intc_sched_lit[i]: called from block offset 4 * i + 8, the pc | pure flag word
+// is before the block
+	Label intcSchedLabel;
+	for (int i = 0; i < SchedLitStubs; i++)
+	{
+		intc_sched_lit[i] = GetCursorAddress<const void *>();
+		Ldr(r0, MemOperand(lr, -16 - 4 * i));
+		B(&intcSchedLabel);
+	}
+// intc_sched: r0 is pc | pure block flag, r1 is cycle_counter.
+// Returns cycle_counter in r1
+	Bind(&intcSchedLabel);
 	intc_sched = GetCursorAddress<const void *>();
-	Add(r1, r1, SH4_TIMESLICE);
-	Str(r1, MemOperand(r8, ctxOffset(cycle_counter)));
-	Str(r0, MemOperand(r8, ctxOffset(pc)));
-	Ldr(r0, MemOperand(r8, ctxOffset(CpuRunning)));
-	Cmp(r0, 0);
-	B(eq, &cleanup);
 	Mov(r4, lr);
-	call((void *)UpdateSystem_INTC);
-	Cmp(r0, 0);
-	B(ne, &do_iter);
+	call((void *)idleskip_sched);
+	Cmp(r0, IdleSkipDoIter);
+	B(eq, &do_iter);
+	B(hi, &cleanup);
 	Mov(lr, r4);
-	Ldr(r0, MemOperand(r8, ctxOffset(cycle_counter)));
+	Ldr(r1, MemOperand(r8, ctxOffset(cycle_counter)));
 	Bx(lr);
 // do_iter:
 	Bind(&do_iter);
@@ -2442,8 +2668,14 @@ void Arm32Assembler::genMainLoop()
 	if (!mmu_enabled())
 	{
 		Sub(r2, r8, -rcbOffset(fpcb));
+#ifdef FPCB_L1_SIZE
+		Ubfx(r1, r4, FPCB_L2_BITS + 1, 24 - FPCB_L2_BITS);
+		Ldr(r2, MemOperand(r2, r1, LSL, 2));
+		Ubfx(r1, r4, 1, FPCB_L2_BITS);
+#else
 		Ubfx(r1, r4, 1, 24);	// 24+1 bits: 32 MB
 									// RAM wraps around so if actual RAM size is 16MB, we won't overflow
+#endif
 		Ldr(pc, MemOperand(r2, r1, LSL, 2));
 	}
 	else
@@ -2513,13 +2745,13 @@ void Arm32Assembler::genMainLoop()
 			if (i==1 || i ==2 || i == 3 || i == 4 || i==12 || i==13)
 				continue;
 
-			const void *v;
+			// in the code buffer: rewritten accesses call them with bl
+			const void *v = GetCursorAddress<const void *>();
 			if (i == 0 && s != 3 && s != 4) {
-				v = fn;
+				jump(fn);
 			}
 			else
 			{
-				v = GetCursorAddress<const void *>();
 				Mov(r0, Register(i));
 				if (s == 3)
 					Uxtb(r1, r1);
@@ -2531,6 +2763,12 @@ void Arm32Assembler::genMainLoop()
 			_mem_hndl[read][s % 3][i] = v;
 		}
 	}
+	for (int read = 0; read < 2; read++)
+		for (int i = 0; i < 2; i++)
+		{
+			_mem_func_near[read][i] = GetCursorAddress<const void *>();
+			jump(_mem_func[read][i]);
+		}
 
 	for (int optp = SZ_32I; optp <= SZ_64F; optp++)
 	{

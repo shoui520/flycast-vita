@@ -217,7 +217,15 @@ static_assert(sizeof(Sh4Context) == 512, "Invalid Sh4Context size");
 
 #define FPCB_SIZE (RAM_SIZE_MAX/2)
 #define FPCB_MASK (FPCB_SIZE -1)
-#if HOST_CPU == CPU_ARM
+#ifdef VITA_MEMORY_MODEL
+// The flat table (64 MB) doesn't fit in memory: use a two-level table instead.
+// Each second-level page covers 4 KB of SH4 address space and is allocated
+// when a block is added to it. Unused entries point to a shared page.
+#define FPCB_L2_BITS 11
+#define FPCB_L2_SIZE (1 << FPCB_L2_BITS)
+#define FPCB_L1_SIZE (FPCB_SIZE >> FPCB_L2_BITS)
+#define FPCB_PAD 32_KB
+#elif HOST_CPU == CPU_ARM
 // The arm32 dynarec context register (r8) points past the end of the Sh4RCB struct.
 // To get a pointer to the fpcb table, we substract sizeof(Sh4RCB), which we
 // want to be an i8r4 value that can be substracted in one op (such as 0x4100000)
@@ -228,7 +236,11 @@ static_assert(sizeof(Sh4Context) == 512, "Invalid Sh4Context size");
 #endif
 struct Sh4RCB
 {
+#ifdef FPCB_L1_SIZE
+	void** fpcb[FPCB_L1_SIZE];
+#else
 	void* fpcb[FPCB_SIZE];
+#endif
 	u8 _pad[FPCB_PAD - sizeof(Sh4Context)];
 	Sh4Context cntx;
 };

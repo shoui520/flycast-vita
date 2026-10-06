@@ -162,6 +162,11 @@ static DynarecCodeEntryPtr compilePC(u32 blockcheck_failures)
 		Sh4Recompiler::Instance->ResetCache();
 
 	RuntimeBlockInfo* rbi = sh4Dynarec->allocateBlock();
+#ifdef __vita__
+	extern u32 tmCompiles;
+	extern u32 tmPcs[16];
+	tmPcs[tmCompiles++ % 16] = pc;
+#endif
 
 	if (!rbi->Setup(pc, Sh4cntx.fpscr))
 	{
@@ -182,6 +187,13 @@ static DynarecCodeEntryPtr compilePC(u32 blockcheck_failures)
 	bool block_check = !rbi->read_only;
 	sh4Dynarec->compile(rbi, block_check, do_opts);
 	verify(rbi->code != nullptr);
+#ifdef __vita__
+	// The IR of every live block doesn't fit in memory. Only the last op is
+	// used once the block is compiled (to relink conditional block ends).
+	if (rbi->oplist.size() > 1)
+		rbi->oplist.erase(rbi->oplist.begin(), rbi->oplist.end() - 1);
+	rbi->oplist.shrink_to_fit();
+#endif
 
 	bm_AddBlock(rbi);
 

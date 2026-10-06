@@ -181,11 +181,16 @@ bool init(void **vmem_base_addr, void **sh4rcb_addr, size_t ramSize)
 	ptrint = (ptrint + 0x10000 - 1) & (~0xffff);
 	*sh4rcb_addr = (void*)ptrint;
 	*vmem_base_addr = (void*)(ptrint + sizeof(Sh4RCB));
+#ifdef FPCB_L1_SIZE
+	// Small two-level FPCB: no pages on demand
+	region_unlock(*sh4rcb_addr, sizeof(Sh4RCB));
+#else
 	const size_t fpcb_size = sizeof(((Sh4RCB *)NULL)->fpcb);
 	void *sh4rcb_base_ptr  = (void*)(ptrint + fpcb_size);
 
 	// Now map the memory for the SH4 context, do not include FPCB on purpose (paged on demand).
 	region_unlock(sh4rcb_base_ptr, sizeof(Sh4RCB) - fpcb_size);
+#endif
 
 	return true;
 }

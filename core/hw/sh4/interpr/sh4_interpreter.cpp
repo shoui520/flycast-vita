@@ -50,6 +50,22 @@ void Sh4Interpreter::Run()
 				do
 				{
 					u32 op = ReadNexOp();
+#ifdef __vita__
+					// TELEMETRY (temporary)
+					{
+						constexpr int N = 6000;
+						static u32 tr[N][2];
+						static int n;
+						if (n < N) {
+							tr[n][0] = ctx->pc - 2; tr[n][1] = op | (ctx->r[0] << 16);
+							if (++n == N)
+								for (int i = 0; i < N; i += 8)
+									WARN_LOG(SH4, "TR %08x:%04x %08x:%04x %08x:%04x %08x:%04x %08x:%04x %08x:%04x %08x:%04x %08x:%04x",
+										tr[i][0], tr[i][1] & 0xffff, tr[i+1][0], tr[i+1][1] & 0xffff, tr[i+2][0], tr[i+2][1] & 0xffff, tr[i+3][0], tr[i+3][1] & 0xffff,
+										tr[i+4][0], tr[i+4][1] & 0xffff, tr[i+5][0], tr[i+5][1] & 0xffff, tr[i+6][0], tr[i+6][1] & 0xffff, tr[i+7][0], tr[i+7][1] & 0xffff);
+						}
+					}
+#endif
 
 					ExecuteOpcode(op);
 				} while (ctx->cycle_counter > 0);

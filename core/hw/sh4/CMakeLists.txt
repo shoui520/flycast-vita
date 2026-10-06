@@ -5,6 +5,8 @@ target_sources(${PROJECT_NAME} PRIVATE
         dyna/decoder.h
         dyna/decoder_opcodes.h
         dyna/driver.cpp
+        dyna/idleskip.cpp
+        dyna/idleskip.h
         dyna/ngen.h
         dyna/shil_canonical.h
         dyna/shil.cpp

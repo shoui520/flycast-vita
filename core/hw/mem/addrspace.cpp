@@ -3,6 +3,7 @@
 #include "hw/pvr/pvr_mem.h"
 #include "hw/pvr/elan.h"
 #include "hw/sh4/dyna/blockmanager.h"
+#include "hw/sh4/dyna/idleskip.h"
 #include "hw/sh4/sh4_mem.h"
 #include "oslib/oslib.h"
 #include "oslib/virtmem.h"
@@ -61,8 +62,9 @@ void *readConst(u32 addr, bool& ismem, u32 sz)
 	else
 	{
 		ismem = true;
-		addr <<= iirf;
-		addr >>= iirf;
+		// Only the low bits are the shift count: shifting by the whole value is undefined
+		addr <<= iirf & HANDLER_MAX;
+		addr >>= iirf & HANDLER_MAX;
 
 		return &(((u8 *)ptr)[addr]);
 	}
@@ -94,8 +96,9 @@ void *writeConst(u32 addr, bool& ismem, u32 sz)
 	else
 	{
 		ismem = true;
-		addr <<= iirf;
-		addr >>= iirf;
+		// Only the low bits are the shift count: shifting by the whole value is undefined
+		addr <<= iirf & HANDLER_MAX;
+		addr >>= iirf & HANDLER_MAX;
 
 		return &(((u8 *)ptr)[addr]);
 	}
@@ -112,13 +115,15 @@ T DYNACALL readt(u32 addr)
 
 	if (likely(ptr != nullptr))
 	{
-		addr <<= iirf;
-		addr >>= iirf;
+		// Only the low bits are the shift count: shifting by the whole value is undefined
+		addr <<= iirf & HANDLER_MAX;
+		addr >>= iirf & HANDLER_MAX;
 
 		return *(T *)&((u8 *)ptr)[addr];
 	}
 	else
 	{
+		idleskip_ioReads++;
 		const u32 id = iirf;
 		switch (sz)
 		{
@@ -156,13 +161,15 @@ void DYNACALL writet(u32 addr, T data)
 
 	if (likely(ptr != nullptr))
 	{
-		addr <<= iirf;
-		addr >>= iirf;
+		// Only the low bits are the shift count: shifting by the whole value is undefined
+		addr <<= iirf & HANDLER_MAX;
+		addr >>= iirf & HANDLER_MAX;
 
 		*(T *)&((u8 *)ptr)[addr] = data;
 	}
 	else
 	{
+
 		const u32 id = iirf;
 		switch (sz)
 		{
@@ -346,12 +353,17 @@ static void free_pages(void *p)
 // or by flushing it and making it fault on access again.
 void bm_reset()
 {
+#ifdef FPCB_L1_SIZE
+	// Second-level pages are always on the heap
+	bm_fpcbReset(true);
+#else
 	// If we allocated it via vmem:
 	if (ram_base)
 		virtmem::reset_mem(p_sh4rcb->fpcb, sizeof(p_sh4rcb->fpcb));
 	else
 		// We allocated it via a regular malloc/new/whatever on the heap
 		bm_vmem_pagefill((void**)p_sh4rcb->fpcb, sizeof(p_sh4rcb->fpcb));
+#endif
 }
 
 // This gets called whenever there is a pagefault, it is possible that it lands
@@ -359,6 +371,11 @@ void bm_reset()
 // fault handler this was us, and that the page is resolved and can continue the execution.
 bool bm_lockedWrite(u8* address)
 {
+#ifdef FPCB_L1_SIZE
+	// The two-level table is never protected
+	if (true)
+		return false;
+#endif
 	if (!ram_base)
 		return false;  // No vmem, therefore not us who caused this.
 
@@ -384,6 +401,12 @@ bool reserve()
 		return true;
 
 	virtmem::init((void**)&ram_base, (void**)&p_sh4rcb, RAM_SIZE_MAX + VRAM_SIZE_MAX + ARAM_SIZE_MAX + elan::ERAM_SIZE_MAX);
+#ifdef FPCB_L1_SIZE
+	if (ram_base != nullptr)
+		// The memory isn't necessarily zeroed. Null first-level entries are
+		// replaced by initMappings()
+		memset(p_sh4rcb, 0, sizeof(Sh4RCB));
+#endif
 	return true;
 }
 
@@ -391,8 +414,6 @@ static void termMappings()
 {
 	if (ram_base == nullptr)
 	{
-		free_pages(p_sh4rcb);
-		p_sh4rcb = nullptr;
 		mem_b.free();
 		vram.free();
 		aica::aica_ram.free();
@@ -410,9 +431,16 @@ void initMappings()
 		WARN_LOG(VMEM, "Warning! nvmem is DISABLED (due to failure or not being built-in)");
 
 		// Allocate it all and initialize it.
-		p_sh4rcb = (Sh4RCB*)malloc_pages(sizeof(Sh4RCB));
+		// Keep the SH4 context: the dynarecs keep a reference to it
+		bool newContext = p_sh4rcb == nullptr;
+		if (newContext)
+			p_sh4rcb = (Sh4RCB*)malloc_pages(sizeof(Sh4RCB));
 #if FEAT_SHREC != DYNAREC_NONE
+#ifdef FPCB_L1_SIZE
+		bm_fpcbReset(!newContext);
+#else
 		bm_vmem_pagefill((void**)p_sh4rcb->fpcb, sizeof(p_sh4rcb->fpcb));
+#endif
 #endif
 		memset(&p_sh4rcb->cntx, 0, sizeof(p_sh4rcb->cntx));
 
@@ -423,6 +451,9 @@ void initMappings()
 	}
 	else {
 		NOTICE_LOG(VMEM, "Info: nvmem is enabled");
+#if FEAT_SHREC != DYNAREC_NONE && defined(FPCB_L1_SIZE)
+		bm_fpcbReset(true);
+#endif
 		INFO_LOG(VMEM, "Info: p_sh4rcb: %p ram_base: %p", p_sh4rcb, ram_base);
 		// Map the different parts of the memory file into the new memory range we got.
 		const virtmem::Mapping mem_mappings[] = {
@@ -465,6 +496,9 @@ void release()
 {
 	if (ram_base != nullptr)
 	{
+#if FEAT_SHREC != DYNAREC_NONE && defined(FPCB_L1_SIZE)
+		bm_fpcbReset(true);
+#endif
 		virtmem::destroy();
 		ram_base = nullptr;
 	}
@@ -472,6 +506,12 @@ void release()
 	{
 		unprotectVram(0, VRAM_SIZE);
 		termMappings();
+#if FEAT_SHREC != DYNAREC_NONE && defined(FPCB_L1_SIZE)
+		if (p_sh4rcb != nullptr)
+			bm_fpcbReset(true);
+#endif
+		free_pages(p_sh4rcb);
+		p_sh4rcb = nullptr;
 	}
 }
 
@@ -558,3 +598,13 @@ void getAddress(void** out_ram_base, void** out_ram, void** out_vram, void** out
 }
 
 } // namespace addrspace
+
+#ifdef __vita__
+// TELEMETRY (temporary)
+void tm_addrspace_dump()
+{
+	using namespace addrspace;
+	WARN_LOG(VMEM, "TM memInfo 0c %p 8c %p ac %p 00 %p 80 %p a0 %p mem_b %p", memInfo_ptr[0x0c], memInfo_ptr[0x8c], memInfo_ptr[0xac],
+			memInfo_ptr[0x00], memInfo_ptr[0x80], memInfo_ptr[0xa0], &mem_b[0]);
+}
+#endif

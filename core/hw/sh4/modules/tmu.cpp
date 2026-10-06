@@ -7,6 +7,7 @@
 #include "hw/sh4/sh4_interrupts.h"
 #include "hw/sh4/sh4_mmr.h"
 #include "serialize.h"
+#include "hw/sh4/dyna/idleskip.h"
 
 #define tmu_underflow 0x0100
 #define tmu_UNIE      0x0020
@@ -21,7 +22,7 @@ int tmu_sched[3];
 static s64 tmu_ch_base[3];
 
 inline static u64 now() {
-	return sh4_sched_now64() + SH4_TIMESLICE - p_sh4rcb->cntx.cycle_counter;
+	return sh4_sched_now64() + SH4_TIMESLICE - (p_sh4rcb->cntx.cycle_counter + idleskip_counterBias);
 }
 
 static s64 read_TMU_TCNTch(u32 ch) {

@@ -17,6 +17,9 @@
     along with Flycast.  If not, see <https://www.gnu.org/licenses/>.
  */
 #include "emulator.h"
+#ifdef __vita__
+#include <psp2/kernel/threadmgr.h>
+#endif
 #include "types.h"
 #include "stdclass.h"
 #include "cfg/option.h"
@@ -1003,6 +1006,10 @@ void Emulator::start()
 		getSh4Executor()->Start();
 		threadResult = std::async(std::launch::async, [this] {
 				ThreadName _("Flycast-emu");
+#ifdef __vita__
+				// Keep the SH4 thread on one core
+				sceKernelChangeThreadCpuAffinityMask(0, SCE_KERNEL_CPU_MASK_USER_0);
+#endif
 				InitAudio();
 
 				try {

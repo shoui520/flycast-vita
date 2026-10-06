@@ -7,6 +7,23 @@
 #define DECLARE_CODE_CACHE(Name, Size) alignas(4096) static u8 Name[Size];
 #elif defined(__OpenBSD__)
 #define DECLARE_CODE_CACHE(Name, Size) alignas(4096) static u8 Name[Size] __attribute__((section(".openbsd.mutable")));
+#elif defined(__vita__)
+namespace virtmem {
+u8 *vita_code_area(size_t size);
+// True if a translation fault at this address is caused by a protection change
+// in progress: the access must be retried
+bool vita_transient_fault(void *address);
+}
+// TELEMETRY (temporary): hang trace counters, see core/vita/main.cpp
+#include <atomic>
+enum VitaTrace { VT_FAULTS, VT_TRAMP, VT_INPLACE, VT_TRANSIENT, VT_PROT_IN, VT_PROT_OUT, VT_DECOMMIT_IN,
+	VT_DECOMMIT_OUT, VT_COMMIT_IN, VT_COMMIT_OUT, VT_FAULT_ADDR, VT_FAULT_PC, VT_FRAMES, VT_PHASE, VT_RESETS, VT_MISMAP, VT_COUNT };
+namespace virtmem { u32 vita_check_mirrors(u32 *firstOffset); void vita_vmem_selftest(); }
+extern std::atomic<u32> vitaTrace[VT_COUNT];
+extern bool vitaNoProtect;
+extern bool vitaNoFastmem;
+// Code caches are carved out of a single executable VM domain memory block
+#define DECLARE_CODE_CACHE(Name, Size) static u8 (&Name)[Size] = *reinterpret_cast<u8 (*)[Size]>(virtmem::vita_code_area(Size));
 #elif defined(__unix__) || defined(__SWITCH__) || defined(__HAIKU__)
 #define DECLARE_CODE_CACHE(Name, Size) alignas(4096) static u8 Name[Size] __attribute__((section(".text")));
 #else

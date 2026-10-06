@@ -267,6 +267,13 @@ constexpr size_t operator""_GB(unsigned long long  x)
 	return 1024 * 1024 * 1024 * x;
 }
 
+// PS Vita memory model: two-level dynarec jump table (FPCB) and self-checking
+// RAM blocks instead of write protected code pages. Can be defined on other
+// hosts to test it.
+#if defined(__vita__) && !defined(VITA_MEMORY_MODEL)
+#define VITA_MEMORY_MODEL
+#endif
+
 constexpr u32 RAM_SIZE_MAX = 32_MB;
 constexpr u32 VRAM_SIZE_MAX = 16_MB;
 constexpr u32 ARAM_SIZE_MAX = 8_MB;

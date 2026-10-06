@@ -19,6 +19,7 @@
 #include "ta_ctx.h"
 #include "pvr_mem.h"
 #include <algorithm>
+#include <cstring>
 #include <glm/glm.hpp>
 #include <glm/gtc/type_ptr.hpp>
 
@@ -28,9 +29,18 @@
 static bool is_vertex_inf(const Vertex& vtx)
 {
 	// manic panic ghosts needs 1.0e25f for x and y
-	return std::isnan(vtx.x) || fabsf(vtx.x) > 1e25f
-			|| std::isnan(vtx.y) || fabsf(vtx.y) > 1e25f
-			|| std::isnan(vtx.z) || vtx.z > 3.4e37f;
+	// isnan(x) || fabsf(x) > 1e25f || isnan(y) || fabsf(y) > 1e25f || isnan(z) || z > 3.4e37f,
+	// on the bit patterns: no FPU compares and FPSCR transfers
+	u32 x, y, z;
+	memcpy(&x, &vtx.x, sizeof(x));
+	memcpy(&y, &vtx.y, sizeof(y));
+	memcpy(&z, &vtx.z, sizeof(z));
+	constexpr u32 AbsMask = 0x7fffffff;
+	constexpr u32 Inf = 0x7f800000;
+	constexpr u32 MaxXY = 0x69045951;	// 1e25f
+	constexpr s32 MaxZ = 0x7dcca14b;	// 3.4e37f
+	return (x & AbsMask) > MaxXY || (y & AbsMask) > MaxXY
+			|| (s32)z > MaxZ || (z & AbsMask) > Inf;
 }
 
 struct IndexTrig
@@ -371,6 +381,14 @@ void makePrimRestartIndex(std::vector<PolyParam>& polys, int first, int end, boo
 		return;
 	PolyParam *last_poly = nullptr;
 	const PolyParam *end_poly = polys.data() + end;
+	// Each poly adds at most one restart and two indices per vertex
+	size_t maxSize = ctx.idx.size();
+	for (const PolyParam *poly = &polys[first]; poly != end_poly; poly++)
+		maxSize += poly->count * 2 + 1;
+	const size_t startSize = ctx.idx.size();
+	ctx.idx.resize(maxSize);
+	u32 * const idx = ctx.idx.data();
+	u32 *out = idx + startSize;
 	for (PolyParam *poly = &polys[first]; poly != end_poly; poly++)
 	{
 		int first_index;
@@ -380,20 +398,23 @@ void makePrimRestartIndex(std::vector<PolyParam>& polys, int first, int end, boo
 				&& last_poly->count != 0
 				&& poly->equivalentIgnoreCullingDirection(*last_poly))
 		{
-			ctx.idx.push_back(~0);
+			*out++ = ~0;
 			dupe_next_vtx = poly->isp.CullMode >= 2 && poly->isp.CullMode != last_poly->isp.CullMode;
 			first_index = last_poly->first;
 		}
 		else
 		{
 			last_poly = poly;
-			first_index = ctx.idx.size();
+			first_index = out - idx;
 		}
 		int last_good_vtx = -1;
+		const bool naomi2 = poly->isNaomi2();
 		for (u32 i = 0; i < poly->count; i++)
 		{
 			const Vertex& vtx = ctx.verts[poly->first + i];
-			if (!poly->isNaomi2() && is_vertex_inf(vtx))
+			// the vertices are usually no longer cached: one line fill per vertex
+			__builtin_prefetch(&vtx + 4);
+			if (!naomi2 && is_vertex_inf(vtx))
 			{
 				bool odd = i & 1;
 				while (i < poly->count - 1)
@@ -409,7 +430,7 @@ void makePrimRestartIndex(std::vector<PolyParam>& polys, int first, int end, boo
 						{
 							if (last_good_vtx >= 0)
 								// reset the strip
-								ctx.idx.push_back(~0);
+								*out++ = ~0;
 							if (odd && poly->isp.CullMode >= 2)
 								// repeat next vertex to get culling right
 								dupe_next_vtx = true;
@@ -424,23 +445,24 @@ void makePrimRestartIndex(std::vector<PolyParam>& polys, int first, int end, boo
 				last_good_vtx = poly->first + i;
 				if (dupe_next_vtx)
 				{
-					ctx.idx.push_back(last_good_vtx);
+					*out++ = last_good_vtx;
 					dupe_next_vtx = false;
 				}
-				ctx.idx.push_back(last_good_vtx);
+				*out++ = last_good_vtx;
 			}
 		}
 		if (last_poly == poly)
 		{
 			poly->first = first_index;
-			poly->count = ctx.idx.size() - first_index;
+			poly->count = (out - idx) - first_index;
 		}
 		else
 		{
-			last_poly->count = ctx.idx.size() - last_poly->first;
+			last_poly->count = (out - idx) - last_poly->first;
 			poly->count = 0;
 		}
 	}
+	ctx.idx.resize(out - idx);
 }
 
 //
@@ -454,6 +476,14 @@ void makeIndex(std::vector<PolyParam>& polys, int first, int end, bool merge, re
 	PolyParam *last_poly = nullptr;
 	const PolyParam *end_poly = polys.data() + end;
 	bool cullingReversed = false;
+	// Each poly adds at most two indices to link strips and three per vertex
+	size_t maxSize = ctx.idx.size();
+	for (const PolyParam *poly = &polys[first]; poly != end_poly; poly++)
+		maxSize += poly->count * 3 + 2;
+	const size_t startSize = ctx.idx.size();
+	ctx.idx.resize(maxSize);
+	u32 * const idx = ctx.idx.data();
+	u32 *out = idx + startSize;
 	for (PolyParam *poly = &polys[first]; poly != end_poly; poly++)
 	{
 		int first_index;
@@ -463,18 +493,18 @@ void makeIndex(std::vector<PolyParam>& polys, int first, int end, bool merge, re
 				&& last_poly->count != 0
 				&& poly->equivalentIgnoreCullingDirection(*last_poly))
 		{
-			const u32 last_vtx = ctx.idx[last_poly->first + last_poly->count - 1];
-			ctx.idx.push_back(last_vtx);
+			const u32 last_vtx = idx[last_poly->first + last_poly->count - 1];
+			*out++ = last_vtx;
 			if (poly->isp.CullMode < 2 || poly->isp.CullMode == last_poly->isp.CullMode)
 			{
 				if (cullingReversed)
-					ctx.idx.push_back(last_vtx);
+					*out++ = last_vtx;
 				cullingReversed = false;
 			}
 			else
 			{
 				if (!cullingReversed)
-					ctx.idx.push_back(last_vtx);
+					*out++ = last_vtx;
 				cullingReversed = true;
 			}
 			dupe_next_vtx = true;
@@ -483,14 +513,17 @@ void makeIndex(std::vector<PolyParam>& polys, int first, int end, bool merge, re
 		else
 		{
 			last_poly = poly;
-			first_index = ctx.idx.size();
+			first_index = out - idx;
 			cullingReversed = false;
 		}
 		int last_good_vtx = -1;
+		const bool naomi2 = poly->isNaomi2();
 		for (u32 i = 0; i < poly->count; i++)
 		{
 			const Vertex& vtx = ctx.verts[poly->first + i];
-			if (!poly->isNaomi2() && is_vertex_inf(vtx))
+			// the vertices are usually no longer cached: one line fill per vertex
+			__builtin_prefetch(&vtx + 4);
+			if (!naomi2 && is_vertex_inf(vtx))
 			{
 				while (i < poly->count - 1)
 				{
@@ -501,7 +534,7 @@ void makeIndex(std::vector<PolyParam>& polys, int first, int end, bool merge, re
 						if (last_good_vtx >= 0)
 						{
 							verify(!dupe_next_vtx);
-							ctx.idx.push_back(last_good_vtx);
+							*out++ = last_good_vtx;
 							dupe_next_vtx = true;
 						}
 						break;
@@ -514,25 +547,26 @@ void makeIndex(std::vector<PolyParam>& polys, int first, int end, bool merge, re
 				last_good_vtx = poly->first + i;
 				if (dupe_next_vtx)
 				{
-					ctx.idx.push_back(last_good_vtx);
+					*out++ = last_good_vtx;
 					dupe_next_vtx = false;
 				}
-				const u32 count = ctx.idx.size() - first_index;
+				const u32 count = (out - idx) - first_index;
 				if (((i ^ count) & 1) ^ cullingReversed)
-					ctx.idx.push_back(last_good_vtx);
-				ctx.idx.push_back(last_good_vtx);
+					*out++ = last_good_vtx;
+				*out++ = last_good_vtx;
 			}
 		}
 		if (last_poly == poly)
 		{
 			poly->first = first_index;
-			poly->count = ctx.idx.size() - first_index;
+			poly->count = (out - idx) - first_index;
 		}
 		else
 		{
-			last_poly->count = ctx.idx.size() - last_poly->first;
+			last_poly->count = (out - idx) - last_poly->first;
 			poly->count = 0;
 		}
 	}
+	ctx.idx.resize(out - idx);
 }
 

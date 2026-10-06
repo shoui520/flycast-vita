@@ -8,6 +8,26 @@
 #include <algorithm>
 #include <vector>
 
+// Leaves new elements uninitialized on resize()
+template<typename T>
+struct DefaultInitAllocator : std::allocator<T>
+{
+	template<typename U>
+	struct rebind {
+		using other = DefaultInitAllocator<U>;
+	};
+	using std::allocator<T>::allocator;
+
+	template<typename U>
+	void construct(U *p) {
+		::new((void *)p) U;
+	}
+	template<typename U, typename... Args>
+	void construct(U *p, Args&&... args) {
+		::new((void *)p) U(std::forward<Args>(args)...);
+	}
+};
+
 class BaseTextureCacheData;
 struct N2LightModel;
 
@@ -263,8 +283,8 @@ struct rend_context
 	RGBAColor fog_clamp_min;
 	RGBAColor fog_clamp_max;
 
-	std::vector<Vertex> verts;
-	std::vector<u32> idx;
+	std::vector<Vertex, DefaultInitAllocator<Vertex>> verts;	// see ta_vtx.cpp newVertex()
+	std::vector<u32, DefaultInitAllocator<u32>> idx;
 	std::vector<ModTriangle> modtrig;
 	std::vector<ModifierVolumeParam> global_param_mvo;
 	std::vector<ModifierVolumeParam> global_param_mvo_tr;

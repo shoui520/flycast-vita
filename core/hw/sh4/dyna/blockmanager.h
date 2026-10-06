@@ -43,6 +43,8 @@ struct RuntimeBlockInfo
 	BlockEndType BlockType;
 	bool has_jcond;
 	bool read_only;
+	// idle-skip probes can interpret the block: -1 unknown, 0 no, 1 yes
+	int8_t idleskipInterpretable = -1;
 
 	std::vector<shil_opcode> oplist;
 	//predecessors references
@@ -72,6 +74,9 @@ DynarecCodeEntryPtr DYNACALL bm_GetCodeByVAddr(u32 addr);
 RuntimeBlockInfoPtr bm_GetBlock(void* dynarec_code);
 RuntimeBlockInfoPtr bm_GetStaleBlock(void* dynarec_code);
 RuntimeBlockInfoPtr DYNACALL bm_GetBlock(u32 addr);
+// Incremented when blocks are discarded: RuntimeBlockInfo pointers stay valid
+// while it doesn't change
+extern u32 bm_generation;
 
 void bm_AddBlock(RuntimeBlockInfo* blk);
 void bm_DiscardBlock(RuntimeBlockInfo* block);
@@ -84,6 +89,9 @@ void bm_Init();
 void bm_Term();
 
 void bm_vmem_pagefill(void** ptr,u32 size_bytes);
+#ifdef FPCB_L1_SIZE
+void bm_fpcbReset(bool freePages);
+#endif
 static inline bool bm_IsRamPageProtected(u32 addr)
 {
 	extern bool *unprotected_pages;

@@ -33,6 +33,9 @@ struct sched_list
 static u64 sh4_sched_ffb;
 static std::vector<sched_list> sch_list;
 static int sh4_sched_next_id = -1;
+// Set while sh4_sched_tick runs the callbacks: the next event is computed
+// once at the end. sh4_sched_ffts() doesn't change sh4_sched_now().
+static bool sh4_sched_in_tick;
 
 static u32 sh4_sched_now();
 
@@ -135,7 +138,8 @@ void sh4_sched_request(int id, int cycles)
 			sched.end++;
 	}
 
-	sh4_sched_ffts();
+	if (!sh4_sched_in_tick)
+		sh4_sched_ffts();
 }
 
 bool sh4_sched_is_scheduled(int id)
@@ -177,12 +181,14 @@ void sh4_sched_tick(int cycles)
 	u32 fztime = sh4_sched_now() - cycles;
 	if (sh4_sched_next_id != -1)
 	{
+		sh4_sched_in_tick = true;
 		for (sched_list& sched : sch_list)
 		{
 			int remaining = sh4_sched_remaining(sched, fztime);
 			if (remaining >= 0 && remaining <= cycles)
 				handle_cb(sched);
 		}
+		sh4_sched_in_tick = false;
 	}
 	sh4_sched_ffts();
 }

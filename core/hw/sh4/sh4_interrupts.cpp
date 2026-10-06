@@ -194,6 +194,12 @@ static void Do_Interrupt(Sh4ExceptionCode intEvn)
 	UpdateSR();
 	Sh4cntx.pc = Sh4cntx.vbr + 0x600;
 	debugger::subroutineCall();
+#ifdef __vita__
+	// TELEMETRY (temporary)
+	static int tmCount;
+	if (tmCount++ < 10)
+		WARN_LOG(SH4, "TM interrupt %x at %08x vbr %08x", intEvn, Sh4cntx.spc, Sh4cntx.vbr);
+#endif
 }
 
 void Do_Exception(u32 epc, Sh4ExceptionCode expEvn)
@@ -203,6 +209,12 @@ void Do_Exception(u32 epc, Sh4ExceptionCode expEvn)
 	if (Sh4cntx.sr.BL != 0)
 		throw FlycastException("Fatal: SH4 exception when blocked");
 	CCN_EXPEVT = expEvn;
+#ifdef __vita__
+	// TELEMETRY (temporary)
+	static int tmCount;
+	if (tmCount++ < 10)
+		WARN_LOG(SH4, "TM exception %x at %08x vbr %08x sr %08x", expEvn, epc, Sh4cntx.vbr, Sh4cntx.sr.getFull());
+#endif
 
 	Sh4cntx.ssr = Sh4cntx.sr.getFull();
 	Sh4cntx.spc = epc;

@@ -27,6 +27,45 @@
 static std::string lastStateFile;
 static time_t lastStateTime;
 
+#ifdef __vita__
+#include <psp2/kernel/sysmem.h>
+
+// A serialized state is tens of MB: it doesn't fit in the newlib heap next to
+// the running emulator, so it gets its own memory block
+static SceUID stateBlock = -1;
+
+static void *allocStateBuffer(size_t size)
+{
+	verify(stateBlock < 0);
+	SceUID block = sceKernelAllocMemBlock("flycast_state", SCE_KERNEL_MEMBLOCK_TYPE_USER_RW,
+			(size + 0xfff) & ~0xfff, nullptr);
+	void *base;
+	if (block < 0)
+		return nullptr;
+	if (sceKernelGetMemBlockBase(block, &base) < 0)
+	{
+		sceKernelFreeMemBlock(block);
+		return nullptr;
+	}
+	stateBlock = block;
+	return base;
+}
+
+static void freeStateBuffer(void *)
+{
+	sceKernelFreeMemBlock(stateBlock);
+	stateBlock = -1;
+}
+#else
+static void *allocStateBuffer(size_t size) {
+	return malloc(size);
+}
+
+static void freeStateBuffer(void *data) {
+	free(data);
+}
+#endif
+
 #if defined(__ANDROID__)
     #include <android/api-level.h>
     // fmemopen was added in Marshmallow (API 23)
@@ -188,7 +227,7 @@ void dc_savestate(int index, const u8 *pngData, u32 pngSize)
 	Serializer ser;
 	dc_serialize(ser);
 
-	void *data = malloc(ser.size());
+	void *data = allocStateBuffer(ser.size());
 	if (data == nullptr)
 	{
 		WARN_LOG(SAVESTATE, "Failed to save state - could not malloc %d bytes", (int)ser.size());
@@ -220,7 +259,7 @@ void dc_savestate(int index, const u8 *pngData, u32 pngSize)
 	{
 		WARN_LOG(SAVESTATE, "Failed to save state - could not open %s for writing", filename.c_str());
 		os_notify(i18n::T("Cannot open save file"), 5000);
-		free(data);
+		freeStateBuffer(data);
     	return;
 	}
 
@@ -245,7 +284,7 @@ void dc_savestate(int index, const u8 *pngData, u32 pngSize)
 	zipFile.Close();
 #endif
 
-	free(data);
+	freeStateBuffer(data);
 	NOTICE_LOG(SAVESTATE, "Saved state to %s size %d", filename.c_str(), (int)ser.size());
 	os_notify(i18n::T("State saved"), 2000);
 	return;
@@ -257,7 +296,7 @@ fail:
 		zipFile.Close();
 	else
 		delete f;
-	free(data);
+	freeStateBuffer(data);
 	// delete failed savestate?
 }
 
@@ -323,7 +362,7 @@ void dc_loadstate(int index)
 		total_size = (u32)f->tell() - pos;
 		f->seek(pos, SEEK_SET);
 	}
-	void *data = malloc(total_size);
+	void *data = allocStateBuffer(total_size);
 	if (data == nullptr)
 	{
 		WARN_LOG(SAVESTATE, "Failed to load state - could not malloc %d bytes", total_size);
@@ -350,7 +389,7 @@ void dc_loadstate(int index)
 	{
 		WARN_LOG(SAVESTATE, "Failed to load state - I/O error");
 		os_notify(i18n::T("Failed to load state"), 5000, i18n::T("I/O error"));
-		free(data);
+		freeStateBuffer(data);
 		return;
 	}
 
@@ -366,7 +405,7 @@ void dc_loadstate(int index)
 		os_notify(i18n::T("Failed to load state"), 5000, e.what());
 	}
 
-	free(data);
+	freeStateBuffer(data);
 }
 
 time_t dc_getStateCreationDate(int index)

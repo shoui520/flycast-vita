@@ -20,6 +20,22 @@ if(NOT DEFINED ARCHITECTURE)
 endif()
 message(STATUS "Target architecture: ${ARCHITECTURE}")
 
+if(VITA)
+	include("${VITASDK}/share/vita.cmake" REQUIRED)
+	set(VITA_DEPS_PREFIX "" CACHE PATH "Prefix of the vitaGL and SDL2 (vitagl backend) builds if they aren't installed in the VitaSDK")
+	# Not available or not wanted on the Vita
+	set(USE_OPENMP OFF)
+	set(USE_ALSA OFF)
+	set(USE_LIBAO OFF)
+	set(USE_PULSEAUDIO OFF)
+	set(USE_LUA OFF)
+	set(USE_HOST_LIBZIP OFF)
+	add_compile_definitions(_GNU_SOURCE)
+	if(VITA_DEPS_PREFIX)
+		set(SDL2_DIR "${VITA_DEPS_PREFIX}/lib/cmake/SDL2")
+	endif()
+endif()
+
 option(ENABLE_CTEST "Enables unit tests" OFF)
 option(ENABLE_OPROFILE "Enable OProfile" OFF)
 option(TEST_AUTOMATION "Enable test automation" OFF)
@@ -77,7 +93,10 @@ set_target_properties(${PROJECT_NAME} PROPERTIES
 		CMAKE_CXX_STANDARD 20
 		CMAKE_CXX_STANDARD_REQUIRED ON)
 
-set_target_properties(${PROJECT_NAME} PROPERTIES LINK_FLAGS_RELEASE -s)
+if(NOT VITA)
+	# Vita executables need their relocations
+	set_target_properties(${PROJECT_NAME} PROPERTIES LINK_FLAGS_RELEASE -s)
+endif()
 target_compile_options(${PROJECT_NAME} PRIVATE
 	$<$<COMPILE_LANGUAGE:CXX>:-fno-strict-aliasing>
 	$<$<COMPILE_LANGUAGE:CXX>:-Wall>)
@@ -124,7 +143,7 @@ endif()
 
 find_package(SDL2 2.0.18)
 if(SDL2_FOUND)
-	if(TARGET SDL2::SDL2main AND NOT BUILD_TESTING)
+	if(TARGET SDL2::SDL2main AND NOT BUILD_TESTING AND NOT VITA)
 		target_link_libraries(${PROJECT_NAME} PRIVATE SDL2::SDL2main)
 	endif()
 
@@ -139,8 +158,14 @@ if(SDL2_FOUND)
 	add_subdirectory(core/sdl)
 endif()
 
-find_package(CURL REQUIRED)
-target_link_libraries(${PROJECT_NAME} PRIVATE CURL::libcurl)
+if(VITA)
+	# The VitaSDK CURL package references the SDK build location
+	target_compile_definitions(${PROJECT_NAME} PRIVATE CURL_STATICLIB)
+	target_link_libraries(${PROJECT_NAME} PRIVATE curl ssl crypto zstd z)
+else()
+	find_package(CURL REQUIRED)
+	target_link_libraries(${PROJECT_NAME} PRIVATE CURL::libcurl)
+endif()
 
 find_package(ZLIB)
 if(TARGET ZLIB::ZLIB)
@@ -182,6 +207,10 @@ else()
 	option(WITH_SYSTEM_ZSTD "Use system provided zstd library" ON)
 	add_subdirectory(core/deps/libchdr EXCLUDE_FROM_ALL)
 	target_link_libraries(${PROJECT_NAME} PRIVATE chdr-static)
+	if(VITA)
+		# vita-elf-create can't handle position-independent code relocations
+		set_target_properties(libzstd_static lzma PROPERTIES POSITION_INDEPENDENT_CODE OFF)
+	endif()
 	target_include_directories(${PROJECT_NAME} PRIVATE core/deps/libchdr/include)
 endif()
 
@@ -268,6 +297,54 @@ if(UNIX)
 	target_link_libraries(${PROJECT_NAME} PRIVATE ${CMAKE_DL_LIBS})
 endif()
 
+if(VITA)
+	target_compile_definitions(${PROJECT_NAME} PRIVATE GLES GLES2 ASIO_DISABLE_SERIAL_PORT ASIO_DISABLE_LOCAL_SOCKETS
+		IMGUI_DISABLE_DEFAULT_SHELL_FUNCTIONS)
+	# The ARM dynarecs call C++ code with BL: it must not be Thumb code
+	target_compile_options(${PROJECT_NAME} PRIVATE -marm)
+	target_include_directories(${PROJECT_NAME} BEFORE PRIVATE core/vita/include)
+	if(VITA_DEPS_PREFIX)
+		target_include_directories(${PROJECT_NAME} BEFORE PRIVATE "${VITA_DEPS_PREFIX}/include")
+		target_link_directories(${PROJECT_NAME} BEFORE PRIVATE "${VITA_DEPS_PREFIX}/lib")
+	endif()
+	target_link_libraries(${PROJECT_NAME} PRIVATE
+		vitaGL
+		vitashark
+		SceShaccCg_stub
+		SceShaccCgExt
+		mathneon
+		taihen_stub
+		kubridge_stub_weak
+		SceAppMgr_stub
+		SceAppUtil_stub
+		SceAudio_stub
+		SceAudioIn_stub
+		SceCommonDialog_stub
+		SceCtrl_stub
+		SceDisplay_stub
+		SceGxm_stub
+		SceHid_stub
+		SceIme_stub
+		SceKernelDmacMgr_stub
+		SceLibKernel_stub
+		SceMotion_stub
+		SceNet_stub
+		SceNetCtl_stub
+		ScePgf_stub
+		ScePower_stub
+		SceSysmodule_stub
+		SceTouch_stub
+		SceVshBridge_stub
+		# libstdc++ only enables std::thread if all of pthread is linked
+		-Wl,--whole-archive pthread -Wl,--no-whole-archive)
+	target_sources(${PROJECT_NAME} PRIVATE
+		core/linux/common.cpp
+		core/linux/unwind_info.cpp
+		core/vita/main.cpp
+		core/vita/posix_compat.cpp
+		core/vita/vita_vmem.cpp)
+endif()
+
 if(ASAN)
 	target_compile_options(${PROJECT_NAME} PRIVATE -fsanitize=address -static-libasan)
 	set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fsanitize=address -static-libasan")
@@ -280,7 +357,9 @@ target_sources(${PROJECT_NAME} PRIVATE
 add_subdirectory(core/deps/nowide EXCLUDE_FROM_ALL)
 target_link_libraries(${PROJECT_NAME} PRIVATE nowide::nowide)
 
-if(NOT MINIUPNP_FOUND)
+if(VITA)
+	target_compile_definitions(${PROJECT_NAME} PRIVATE FEAT_NO_MINIUPNPC)
+elseif(NOT MINIUPNP_FOUND)
 	option(UPNPC_BUILD_SHARED "Build shared library" OFF)
 	option(UPNPC_BUILD_TESTS "Build test executables" OFF)
 	option(UPNPC_BUILD_SAMPLE "Build sample executables" OFF)
@@ -325,13 +404,15 @@ if(USE_LIBCDIO)
 	endif()
 endif()
 
-target_compile_definitions(${PROJECT_NAME} PRIVATE USE_ICE)
-# libjuice
-option(BUILD_SHARED_LIBS "Build shared libraries" OFF)
-option(NO_SERVER "Disable server support" ON)
-option(NO_TESTS "Disable tests build" ON)
-add_subdirectory(core/deps/libjuice EXCLUDE_FROM_ALL)
-target_link_libraries(${PROJECT_NAME} PRIVATE LibJuice::LibJuiceStatic)
+if(NOT VITA)
+	target_compile_definitions(${PROJECT_NAME} PRIVATE USE_ICE)
+	# libjuice
+	option(BUILD_SHARED_LIBS "Build shared libraries" OFF)
+	option(NO_SERVER "Disable server support" ON)
+	option(NO_TESTS "Disable tests build" ON)
+	add_subdirectory(core/deps/libjuice EXCLUDE_FROM_ALL)
+	target_link_libraries(${PROJECT_NAME} PRIVATE LibJuice::LibJuiceStatic)
+endif()
 
 # websocket++
 target_include_directories(${PROJECT_NAME} PRIVATE core/deps/websocketpp)
@@ -458,6 +539,7 @@ add_subdirectory(core/wsi)
 
 include(resources/resources.cmake)
 
+if(UNIX)
 target_sources(${PROJECT_NAME} PRIVATE
 		core/linux/common.cpp
 		core/linux/context.cpp
@@ -469,6 +551,7 @@ target_sources(${PROJECT_NAME} PRIVATE
 		core/linux-dist/x11.cpp
 		core/linux-dist/x11.h
 		core/linux-dist/x11_keyboard.h)
+endif()
 
 target_sources(${PROJECT_NAME} PRIVATE
 		core/deps/rcheevos/src/rc_client_raintegration.c
@@ -616,7 +699,7 @@ target_sources(${PROJECT_NAME} PRIVATE
 	core/deps/ggpo/lib/ggpo/network/udp.cpp
 	core/deps/ggpo/lib/ggpo/network/udp.h)
 
-if(NOT BUILD_TESTING)
+if(NOT BUILD_TESTING AND NOT VITA)
 	target_sources(${PROJECT_NAME} PRIVATE core/linux-dist/main.cpp)
 endif()
 
@@ -625,4 +708,15 @@ if(BUILD_TESTING)
 	add_subdirectory(tests)
 endif()
 
-install(TARGETS ${PROJECT_NAME} DESTINATION "${CMAKE_INSTALL_BINDIR}")
+if(VITA)
+	vita_create_self(eboot.bin ${PROJECT_NAME} UNSAFE NOASLR)
+	vita_create_vpk(Flycast.vpk FLYCASTDC eboot.bin
+		NAME "Flycast"
+		VERSION 01.00
+		FILE ${CMAKE_SOURCE_DIR}/shell/vita/icon0.png sce_sys/icon0.png
+		${CMAKE_SOURCE_DIR}/shell/vita/bg.png sce_sys/livearea/contents/bg.png
+		${CMAKE_SOURCE_DIR}/shell/vita/startup.png sce_sys/livearea/contents/startup.png
+		${CMAKE_SOURCE_DIR}/shell/vita/template.xml sce_sys/livearea/contents/template.xml)
+else()
+	install(TARGETS ${PROJECT_NAME} DESTINATION "${CMAKE_INSTALL_BINDIR}")
+endif()

@@ -7,6 +7,7 @@
 #include <set>
 #include <map>
 #include "blockmanager.h"
+#include "hw/mem/addrspace.h"
 #include "ngen.h"
 
 #include "hw/sh4/sh4_core.h"
@@ -41,13 +42,50 @@ static bm_Map blkmap;
 u32 protected_blocks;
 u32 unprotected_blocks;
 
+#ifdef FPCB_L1_SIZE
+static void *fpcbUnused[FPCB_L2_SIZE];
+
+static DynarecCodeEntryPtr fpcbGet(u32 addr)
+{
+	u32 i = (addr >> 1) & FPCB_MASK;
+	return (DynarecCodeEntryPtr)p_sh4rcb->fpcb[i >> FPCB_L2_BITS][i & (FPCB_L2_SIZE - 1)];
+}
+
+static void fpcbSet(u32 addr, DynarecCodeEntryPtr code)
+{
+	u32 i = (addr >> 1) & FPCB_MASK;
+	void **&page = p_sh4rcb->fpcb[i >> FPCB_L2_BITS];
+	if (page == fpcbUnused)
+	{
+		if (code == ngen_FailedToFindBlock)
+			return;
+		page = new void*[FPCB_L2_SIZE];
+		bm_vmem_pagefill(page, FPCB_L2_SIZE * sizeof(void *));
+	}
+	page[i & (FPCB_L2_SIZE - 1)] = (void *)code;
+}
+
+void bm_fpcbReset(bool freePages)
+{
+	bm_vmem_pagefill(fpcbUnused, sizeof(fpcbUnused));
+	for (void **&page : p_sh4rcb->fpcb)
+	{
+		if (freePages && page != fpcbUnused)
+			delete[] page;
+		page = fpcbUnused;
+	}
+}
+#else
 #define FPCA(x) ((DynarecCodeEntryPtr&)p_sh4rcb->fpcb[(x>>1)&FPCB_MASK])
+#define fpcbGet(x) FPCA(x)
+#define fpcbSet(x, code) (FPCA(x) = (code))
+#endif
 
 // addr must be a physical address
 // This returns an executable address
 static DynarecCodeEntryPtr DYNACALL bm_GetCode(u32 addr)
 {
-	DynarecCodeEntryPtr rv = FPCA(addr);
+	DynarecCodeEntryPtr rv = fpcbGet(addr);
 
 	return rv;
 }
@@ -220,7 +258,7 @@ void bm_AddBlock(RuntimeBlockInfo* blk)
 	blkmap[(void*)block->code] = block;
 
 	verify((void*)bm_GetCode(block->addr) == (void*)ngen_FailedToFindBlock);
-	FPCA(block->addr) = (DynarecCodeEntryPtr)CC_RW2RX(block->code);
+	fpcbSet(block->addr, (DynarecCodeEntryPtr)CC_RW2RX(block->code));
 
 #ifdef DYNA_OPROF
 	if (oprofHandle)
@@ -238,8 +276,11 @@ void bm_AddBlock(RuntimeBlockInfo* blk)
 
 }
 
+u32 bm_generation;
+
 void bm_DiscardBlock(RuntimeBlockInfo* block)
 {
+	bm_generation++;
 	// Remove from block map
 	auto it = blkmap.find((void*)block->code);
 	verify(it != blkmap.end());
@@ -253,7 +294,7 @@ void bm_DiscardBlock(RuntimeBlockInfo* block)
 
 	// Remove from jump table
 	verify((void*)bm_GetCode(block_ptr->addr) == CC_RW2RX((void*)block_ptr->code));
-	FPCA(block_ptr->addr) = ngen_FailedToFindBlock;
+	fpcbSet(block_ptr->addr, ngen_FailedToFindBlock);
 
 	if (block_ptr->temp_block)
 		all_temp_blocks.erase(block_ptr);
@@ -262,8 +303,37 @@ void bm_DiscardBlock(RuntimeBlockInfo* block)
 	block_ptr->Discard();
 }
 
+#ifdef __vita__
+// TELEMETRY (temporary)
+void vita_mem_report(const char *where);
+static u32 tmResets;
+u32 tmCompiles;
+u32 tmPcs[16];
+void bm_report()
+{
+	WARN_LOG(DYNAREC, "TM pcs: %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x",
+			tmPcs[0], tmPcs[1], tmPcs[2], tmPcs[3], tmPcs[4], tmPcs[5], tmPcs[6], tmPcs[7],
+			tmPcs[8], tmPcs[9], tmPcs[10], tmPcs[11], tmPcs[12], tmPcs[13], tmPcs[14], tmPcs[15]);
+	if (p_sh4rcb != nullptr)
+	{
+		WARN_LOG(DYNAREC, "TM sh4 pc %08x pr %08x", p_sh4rcb->cntx.pc, p_sh4rcb->cntx.pr);
+		WARN_LOG(DYNAREC, "TM fpcb rcb %p l1[0] %p l1[0xa00] %p unused %p unused[0] %p handler %p", p_sh4rcb, p_sh4rcb->fpcb[0], p_sh4rcb->fpcb[0xa00], fpcbUnused, fpcbUnused[0], ngen_FailedToFindBlock);
+		void tm_addrspace_dump();
+		if (p_sh4rcb->cntx.pc != 0) tm_addrspace_dump();
+		if (p_sh4rcb->cntx.pc != 0) WARN_LOG(DYNAREC, "TM rom %08x %08x %08x %08x ram %08x %08x %08x %08x", addrspace::read32(0xa0000000), addrspace::read32(0xa0000004),
+				addrspace::read32(0x80000000), addrspace::read32(0x80000004),
+				addrspace::read32(0x8c000000), addrspace::read32(0x8c000004), addrspace::read32(0x8c008000), addrspace::read32(0x8c010000));
+	}
+	WARN_LOG(DYNAREC, "TM bm: compiles %u resets %u blocks %u temp %u del %u", tmCompiles, tmResets, (u32)blkmap.size(), (u32)all_temp_blocks.size(), (u32)del_blocks.size());
+}
+#endif
+
 void bm_Periodical_1s()
 {
+#ifdef __vita__
+	WARN_LOG(DYNAREC, "TM 1s: resets %u blocks %u temp %u del %u", tmResets, (u32)blkmap.size(), (u32)all_temp_blocks.size(), (u32)del_blocks.size());
+	vita_mem_report("1s");
+#endif
 	bm_CleanupDeletedBlocks();
 }
 
@@ -326,6 +396,17 @@ void bm_UnlockPage(u32 addr, u32 size)
 
 void bm_ResetCache()
 {
+#ifdef __vita__
+	vitaTrace[VT_RESETS]++;
+#endif
+#ifdef __vita__
+	if (++tmResets <= 20 || tmResets % 100 == 0)
+	{
+		WARN_LOG(DYNAREC, "TM reset %u: blocks %u del %u", tmResets, (u32)blkmap.size(), (u32)del_blocks.size());
+		vita_mem_report("reset");
+	}
+#endif
+	bm_generation++;
 	sh4Dynarec->reset();
 	addrspace::bm_reset();
 
@@ -367,11 +448,12 @@ void bm_ResetCache()
 
 void bm_ResetTempCache(bool full)
 {
+	bm_generation++;
 	if (!full)
 	{
 		for (const auto& block : all_temp_blocks)
 		{
-			FPCA(block->addr) = ngen_FailedToFindBlock;
+			fpcbSet(block->addr, ngen_FailedToFindBlock);
 			blkmap.erase((void*)block->code);
 		}
 	}
@@ -481,8 +563,19 @@ void RuntimeBlockInfo::Discard()
 
 void RuntimeBlockInfo::SetProtectedFlags()
 {
+#ifdef VITA_MEMORY_MODEL
+	// Only the reserved guest address space can be write protected:
+	// otherwise blocks check their code instead
+#ifdef __vita__
+	const bool canProtect = addrspace::virtmemEnabled() && !vitaNoProtect;
+#else
+	const bool canProtect = addrspace::virtmemEnabled();
+#endif
+#else
+	constexpr bool canProtect = true;
+#endif
 	// Don't write protect rom and BIOS/IP.BIN (Grandia II)
-	if (!IsOnRam(addr) || (addr & 0x1FFF0000) == 0x0c000000)
+	if (!canProtect || !IsOnRam(addr) || (addr & 0x1FFF0000) == 0x0c000000)
 	{
 		this->read_only = false;
 		unprotected_blocks++;

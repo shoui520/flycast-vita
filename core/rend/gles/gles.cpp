@@ -539,8 +539,16 @@ void findGLVersion()
 			INFO_LOG(RENDERER, "Packed depth/stencil not supported: no modifier volumes when rendering to a texture");
 		GLint ranges[2];
 		GLint precision;
-		glGetShaderPrecisionFormat(GL_FRAGMENT_SHADER, GL_HIGH_FLOAT, ranges, &precision);
-		gl.highp_float_supported = (ranges[0] != 0 || ranges[1] != 0) && precision != 0;
+		if (glGetShaderPrecisionFormat != nullptr)
+		{
+			glGetShaderPrecisionFormat(GL_FRAGMENT_SHADER, GL_HIGH_FLOAT, ranges, &precision);
+			gl.highp_float_supported = (ranges[0] != 0 || ranges[1] != 0) && precision != 0;
+		}
+		else
+		{
+			// Not implemented by some drivers (vitaGL)
+			gl.highp_float_supported = true;
+		}
 		if (!gl.border_clamp_supported)
 			gl.border_clamp_supported = strstr(extensions, "GL_EXT_texture_border_clamp") != nullptr;
 	}
@@ -700,8 +708,12 @@ GLuint gl_CompileAndLink(const char *vertexShader, const char *fragmentShader)
 		throw RendererException(i18n::T("OpenGL shader compilation failed"));
 		// FIXME MINIDUMP-8A1, MINIDUMP-8A2, MINIDUMP-7YE
 	}
-	glDetachShader(program, vs);
-	glDetachShader(program, ps);
+	// Not implemented by some drivers (vitaGL)
+	if (glDetachShader != nullptr)
+	{
+		glDetachShader(program, vs);
+		glDetachShader(program, ps);
+	}
 	glDeleteShader(vs);
 	glDeleteShader(ps);
 
@@ -1087,12 +1099,14 @@ static void upload_vertex_indices()
 {
 	if (gl.index_type == GL_UNSIGNED_SHORT)
 	{
-		static std::vector<u16> short_idx;
-		short_idx.clear();
-		short_idx.reserve(gl.rendContext->idx.size());
-		for (u32 i : gl.rendContext->idx)
-			short_idx.push_back(i);
-		gl.vbo.idxs->update(short_idx.data(), short_idx.size() * sizeof(u16));
+		static std::vector<u16, DefaultInitAllocator<u16>> short_idx;
+		const size_t size = gl.rendContext->idx.size();
+		short_idx.resize(size);
+		const u32 *src = gl.rendContext->idx.data();
+		u16 *dst = short_idx.data();
+		for (size_t i = 0; i < size; i++)
+			dst[i] = src[i];
+		gl.vbo.idxs->update(dst, size * sizeof(u16));
 	}
 	else
 		gl.vbo.idxs->update(gl.rendContext->idx.data(), gl.rendContext->idx.size() * sizeof(decltype(*gl.rendContext->idx.data())));

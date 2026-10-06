@@ -634,8 +634,11 @@ bool    ImGui_ImplOpenGL3_CreateDeviceObjects()
     if (!CheckProgram(bd->ShaderHandle, "shader program"))
         return false;
 
-    glDetachShader(bd->ShaderHandle, vert_handle);
-    glDetachShader(bd->ShaderHandle, frag_handle);
+    if (glDetachShader != NULL)
+    {
+        glDetachShader(bd->ShaderHandle, vert_handle);
+        glDetachShader(bd->ShaderHandle, frag_handle);
+    }
     glDeleteShader(vert_handle);
     glDeleteShader(frag_handle);
 

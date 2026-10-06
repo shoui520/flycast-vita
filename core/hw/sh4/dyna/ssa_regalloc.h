@@ -370,6 +370,11 @@ private:
 			auto it = reg_alloced.find(sh4reg);
 			if (it == reg_alloced.end())
 			{
+				if (param.is_r32i() == IsFloat(sh4reg))	// TELEMETRY (temporary)
+				{
+					{ shil_opcode *op = &block->oplist[opnum]; ERROR_LOG(DYNAREC, "regalloc pool mismatch: %08x %s reg %s", block->vaddr + op->guest_offs, op->dissasm().c_str(), name_reg(sh4reg).c_str()); }
+					die("regalloc pool mismatch");
+				}
 				u32 host_reg;
 				if (param.is_r32i())
 				{
@@ -448,6 +453,11 @@ private:
 			auto it = reg_alloced.find(sh4reg);
 			if (it == reg_alloced.end())
 			{
+				if (param.is_r32i() == IsFloat(sh4reg))	// TELEMETRY (temporary)
+				{
+					{ shil_opcode *op = &block->oplist[opnum]; ERROR_LOG(DYNAREC, "regalloc pool mismatch: %08x %s reg %s", block->vaddr + op->guest_offs, op->dissasm().c_str(), name_reg(sh4reg).c_str()); }
+					die("regalloc pool mismatch");
+				}
 				u32 host_reg;
 				if (param.is_r32i())
 				{

@@ -413,9 +413,12 @@ enum PCMSType
 
 */
 
-struct ChannelEx
+// Cache line aligned: 256 bytes, 8 lines per channel
+struct alignas(32) ChannelEx
 {
 	static ChannelEx Chans[64];
+	// Bit n set: Chans[n].enabled. Disabled channels aren't touched per sample.
+	static u64 enabledMask;
 
 	ChannelCommonData* ccd;
 
@@ -463,11 +466,14 @@ struct ChannelEx
 		u32 DRAtt;
 		u32 DSPAtt;
 		SampleType* DSPOut;
+		// volumes for ofsatt, ~0u if the attenuations changed
+		u32 ofsatt = ~0u;
+		s32 volL;
+		s32 volR;
+		s32 volDsp;
 	} VolMix;
 	
-	void (ChannelEx::*StepAEG)();
-	void (ChannelEx::*StepFEG)();
-	void (ChannelEx::*StepStream)();
+	void (ChannelEx::*StepStream)(u32 samples);
 	void (ChannelEx::*StepStreamInitial)();
 	
 	struct
@@ -561,10 +567,8 @@ struct ChannelEx
 	bool quiet;
 	int ChannelNumber;
 
-	static void (ChannelEx::*STREAM_STEP_LUT[5][2][2])();
+	static void (ChannelEx::*STREAM_STEP_LUT[5][2][2])(u32 samples);
 	static void (ChannelEx::*STREAM_INITAL_STEP_LUT[5])();
-	static void (ChannelEx::*AEG_STEP_LUT[4])();
-	static void (ChannelEx::*FEG_STEP_LUT[4])();
 
 	template<PCMSType PCMS, bool Last>
 	void StepDecodeSample(u32 CA);
@@ -574,7 +578,7 @@ struct ChannelEx
 		StepDecodeSample<PCMS, true>(0);
 	}
 	template<PCMSType PCMS, bool LPCTL, bool LPSLNK>
-	void StreamStep();
+	void StreamStep(u32 samples);
 
 	template<EGState state>
 	void AegStep();
@@ -592,9 +596,16 @@ struct ChannelEx
 		disable();
 	}
 
+	void setEnabled(bool enabled)
+	{
+		this->enabled = enabled;
+		const u64 bit = 1ull << ChannelNumber;
+		enabledMask = enabled ? enabledMask | bit : enabledMask & ~bit;
+	}
+
 	void disable()
 	{
-		enabled = false;
+		setEnabled(false);
 		SetAegState(EG_Release);
 		AEG.SetValue(0x3FF);
 		CA = 0;
@@ -602,7 +613,7 @@ struct ChannelEx
 
 	void enable()
 	{
-		enabled = true;
+		setEnabled(true);
 	}
 
 	SampleType InterpolateSample()
@@ -614,12 +625,19 @@ struct ChannelEx
 		return rv;
 	}
 
-	SampleType lowPassFilter(SampleType sample)
+	// Filter coefficients for a FEG value and Q. All of them fit in 32 bits:
+	// a0 < 2^30, 0 < f < 1.5 * 2^30.
+	struct FilterCoefs
 	{
-		if (!FEG.active)
-			return sample;
+		u32 fv = ~0u;
+		s32 q;
+		s32 a0, b1, b2;
+	};
+	FilterCoefs filterCoefs;
+
+	[[gnu::noinline]] void updateFilterCoefs(u32 fv)
+	{
 		constexpr u32 COEF_BITS = 30;
-		const u32 fv = FEG.GetValue();
 		const u32 exp = fv >> 9;
 		const u32 mant = (fv & 0x1FF) | 0x200;
 		u64 a0 = ((u64)mant << 30) >> ((15 - exp) * 2);
@@ -627,13 +645,28 @@ struct ChannelEx
 		a0 >>= (47 - COEF_BITS);
 		s64 f = ((s64)mant << exp) << (COEF_BITS - 25);
 		f += (s64)FEG.q * f / 4096;
-		const s64 b1 = 128ll * 1024 * (1 << (COEF_BITS - 16)) - (f + a0);
-		const s64 b2 = 64ll * 1024 * (1 << (COEF_BITS - 16)) - f;
-		if (exp == 0)
+		filterCoefs.fv = fv;
+		filterCoefs.q = FEG.q;
+		filterCoefs.a0 = (s32)a0;
+		filterCoefs.b1 = (s32)(128ll * 1024 * (1 << (COEF_BITS - 16)) - (f + (s64)a0));
+		filterCoefs.b2 = (s32)(64ll * 1024 * (1 << (COEF_BITS - 16)) - f);
+	}
+
+	SampleType lowPassFilter(SampleType sample)
+	{
+		if (!FEG.active)
+			return sample;
+		constexpr u32 COEF_BITS = 30;
+		const u32 fv = FEG.GetValue();
+		if (fv != filterCoefs.fv || FEG.q != filterCoefs.q)
+			updateFilterCoefs(fv);
+		if (fv >> 9 == 0)
 			// avoid residual signal
 			FEG.fractSave = 0;
 
-		const s64 mac = -a0 * sample + b1 * FEG.prev1 - b2 * FEG.prev2 - FEG.fractSave;	// 20+COEF_BITS bits
+		// 32x32 products: sample and prev* are 20 bits
+		const s64 mac = -(s64)filterCoefs.a0 * sample + (s64)filterCoefs.b1 * FEG.prev1
+				- (s64)filterCoefs.b2 * FEG.prev2 - FEG.fractSave;	// 20+COEF_BITS bits
 		sample = mac >> COEF_BITS;
 		FEG.fractSave = ((s64)sample << COEF_BITS) - mac;
 		FEG.prev2 = FEG.prev1;
@@ -670,17 +703,22 @@ struct ChannelEx
 			ofsatt = lfo.alfo + (AEG.GetValue() >> 2);
 			ofsatt = std::min(ofsatt, (u32)255); // make sure it never gets more 255 -- it can happen with some alfo/aeg combinations
 		}
-		u32 const max_att = ((16 << 4) - 1) - ofsatt;
-		
-		s32* logtable = ofsatt + tl_lut;
+		// ofsatt changes slowly: only look up the volumes when it changes
+		if (ofsatt != VolMix.ofsatt)
+		{
+			u32 const max_att = ((16 << 4) - 1) - ofsatt;
 
-		u32 dl = std::min(VolMix.DLAtt, max_att);
-		u32 dr = std::min(VolMix.DRAtt, max_att);
-		u32 ds = std::min(VolMix.DSPAtt, max_att);
+			s32* logtable = ofsatt + tl_lut;
 
-		oLeft = FPMul<s64>(sample, logtable[dl], 19);	// 16 bits
-		oRight = FPMul<s64>(sample, logtable[dr], 19);	// 16 bits
-		oDsp = FPMul<s64>(sample, logtable[ds], 15);	// 20 bits
+			VolMix.ofsatt = ofsatt;
+			VolMix.volL = logtable[std::min(VolMix.DLAtt, max_att)];
+			VolMix.volR = logtable[std::min(VolMix.DRAtt, max_att)];
+			VolMix.volDsp = logtable[std::min(VolMix.DSPAtt, max_att)];
+		}
+
+		oLeft = FPMul<s64>(sample, VolMix.volL, 19);	// 16 bits
+		oRight = FPMul<s64>(sample, VolMix.volR, 19);	// 16 bits
+		oDsp = FPMul<s64>(sample, VolMix.volDsp, 15);	// 20 bits
 
 		clip_verify((s16)oLeft == oLeft);
 		clip_verify((s16)oRight == oRight);
@@ -689,11 +727,51 @@ struct ChannelEx
 		clip_verify((s64)sample * oRight >= 0);
 		clip_verify((s64)sample * oDsp >= 0);
 
-		(this->*StepAEG)();
+		// switches instead of member function pointers: the steps are inlined
+		switch (AEG.state)
+		{
+		case EG_Attack:
+			AegStep<EG_Attack>();
+			break;
+		case EG_Decay1:
+			AegStep<EG_Decay1>();
+			break;
+		case EG_Decay2:
+			AegStep<EG_Decay2>();
+			break;
+		case EG_Release:
+			AegStep<EG_Release>();
+			break;
+		}
 		if (enabled)
 		{
-			(this->*StepFEG)();
-			(this->*StepStream)();
+			// FegStep does nothing if the filter is off
+			if (FEG.active)
+			{
+				switch (FEG.state)
+				{
+				case EG_Attack:
+					FegStep<EG_Attack>();
+					break;
+				case EG_Decay1:
+					FegStep<EG_Decay1>();
+					break;
+				case EG_Decay2:
+					FegStep<EG_Decay2>();
+					break;
+				case EG_Release:
+					FegStep<EG_Release>();
+					break;
+				}
+			}
+			// most samples don't reach the next sample of the stream
+			step.full += FPMul(update_rate, lfo.plfo_step.full, 10);
+			if (step.ip != 0)
+			{
+				const u32 samples = step.ip;
+				step.ip = 0;
+				(this->*StepStream)(samples);
+			}
 			lfo.Step();
 		}
 		return true;
@@ -715,13 +793,15 @@ struct ChannelEx
 
 	static void StepAll(SampleType& mixl, SampleType& mixr)
 	{
-		for (ChannelEx& channel : Chans)
-			channel.Step(mixl, mixr);
+		// disabled channels output nothing. Steps only disable their own channel.
+		// 32-bit halves: a 64-bit mask doesn't leave enough registers for Step
+		for (ChannelEx *base = Chans; base != std::end(Chans); base += 32)
+			for (u32 mask = (u32)(enabledMask >> (base - Chans)); mask != 0; mask &= mask - 1)
+				base[__builtin_ctz(mask)].Step(mixl, mixr);
 	}
 
 	void SetAegState(EGState newstate)
 	{
-		StepAEG = AEG_STEP_LUT[newstate];
 		AEG.state = newstate;
 		if (newstate == EG_Release)
 			ccd->KYONB = 0;
@@ -729,7 +809,6 @@ struct ChannelEx
 
 	void SetFegState(EGState newstate)
 	{
-		StepFEG = FEG_STEP_LUT[newstate];
 		FEG.state = newstate;
 		if (newstate == EG_Attack)
 		{
@@ -907,6 +986,7 @@ struct ChannelEx
 		}
 
 		VolMix.DSPAtt = total_level + SendLevel[ccd->IMXL];
+		VolMix.ofsatt = ~0u;
 	}
 
 	//Q,FLV0,FLV1,FLV2,FLV3,FLV4,FAR,FD1R,FD2R,FRR, LPOFF
@@ -1031,10 +1111,8 @@ struct ChannelEx
 	}
 };
 
-void (ChannelEx::*ChannelEx::STREAM_STEP_LUT[5][2][2])();
+void (ChannelEx::*ChannelEx::STREAM_STEP_LUT[5][2][2])(u32 samples);
 void (ChannelEx::*ChannelEx::STREAM_INITAL_STEP_LUT[5])();
-void (ChannelEx::*ChannelEx::AEG_STEP_LUT[4])();
-void (ChannelEx::*ChannelEx::FEG_STEP_LUT[4])();
 void (ChannelEx::Lfo::*ChannelEx::Lfo::ALFOWS_CALC[4])();
 void (ChannelEx::Lfo::*ChannelEx::Lfo::PLFOWS_CALC[4])();
 
@@ -1146,15 +1224,11 @@ void ChannelEx::StepDecodeSample(u32 CA)
 }
 
 template<PCMSType PCMS, bool LPCTL, bool LPSLNK>
-void ChannelEx::StreamStep()
+void ChannelEx::StreamStep(u32 samples)
 {
-	step.full += FPMul(update_rate, lfo.plfo_step.full, 10);
-	fp_22_10 sp = step;
-	step.ip = 0;
-
-	while (sp.ip > 0)
+	while (samples > 0)
 	{
-		sp.ip--;
+		samples--;
 
 		u32 CA = this->CA + 1;
 		const u32 lea = PCMS == ADPCM_STREAM ? loop.alignedLEA : loop.LEA;
@@ -1200,7 +1274,7 @@ void ChannelEx::StreamStep()
 		this->CA = CA;
 
 		//keep adpcm up to date
-		if (sp.ip == 0)
+		if (samples == 0)
 			StepDecodeSample<PCMS, true>(CA);
 		else
 			StepDecodeSample<PCMS, false>(CA);
@@ -1414,15 +1488,7 @@ static void staticinitialise()
 	ChannelEx::STREAM_INITAL_STEP_LUT[ADPCM_STREAM] = &ChannelEx::StepDecodeSampleInitial<ADPCM_STREAM>;
 	ChannelEx::STREAM_INITAL_STEP_LUT[NOISE] = &ChannelEx::StepDecodeSampleInitial<NOISE>;
 
-	ChannelEx::AEG_STEP_LUT[EG_Attack] = &ChannelEx::AegStep<EG_Attack>;
-	ChannelEx::AEG_STEP_LUT[EG_Decay1] = &ChannelEx::AegStep<EG_Decay1>;
-	ChannelEx::AEG_STEP_LUT[EG_Decay2] = &ChannelEx::AegStep<EG_Decay2>;
-	ChannelEx::AEG_STEP_LUT[EG_Release] = &ChannelEx::AegStep<EG_Release>;
 
-	ChannelEx::FEG_STEP_LUT[EG_Attack] = &ChannelEx::FegStep<EG_Attack>;
-	ChannelEx::FEG_STEP_LUT[EG_Decay1] = &ChannelEx::FegStep<EG_Decay1>;
-	ChannelEx::FEG_STEP_LUT[EG_Decay2] = &ChannelEx::FegStep<EG_Decay2>;
-	ChannelEx::FEG_STEP_LUT[EG_Release] = &ChannelEx::FegStep<EG_Release>;
 
 	ChannelEx::Lfo::ALFOWS_CALC[(int)LFOType::Sawtooth] = &ChannelEx::Lfo::CalcAlfo<LFOType::Sawtooth>;
 	ChannelEx::Lfo::ALFOWS_CALC[(int)LFOType::Square] = &ChannelEx::Lfo::CalcAlfo<LFOType::Square>;
@@ -1462,6 +1528,7 @@ static void staticinitialise()
 static OnLoad staticInit(staticinitialise);
 
 ChannelEx ChannelEx::Chans[64];
+u64 ChannelEx::enabledMask;
 
 #define Chans ChannelEx::Chans
 
@@ -1714,7 +1781,9 @@ void deserialize(Deserializer& deser)
 		deser >> channel.lfo.counter;
 		deser >> channel.lfo.state;
 		channel.UpdateLFO(true);
-		deser >> channel.enabled;
+		bool enabled;
+		deser >> enabled;
+		channel.setEnabled(enabled);
 		channel.quiet = false;
 	}
 	beep.deserialize(deser);
@@ -1734,4 +1803,5 @@ void deserialize(Deserializer& deser)
 	}
 }
 
+static_assert(sizeof(ChannelEx) == 256, "ChannelEx size");
 } // namespace aica::sgc

@@ -177,6 +177,26 @@ std::vector<PolyParam>* BaseTAParser::CurrentPPlist;
 BaseTAParser::TaListFP *BaseTAParser::TaCmd;
 BaseTAParser::TaListFP *BaseTAParser::VertexDataFP;
 
+// ARGB8888 to the host byte order
+template<int Red, int Green, int Blue, int Alpha>
+static inline void packedColor(u8 *to, u32 t)
+{
+	if constexpr (Red == 0 && Green == 1 && Blue == 2 && Alpha == 3)
+	{
+		// RGBA: one word store (rev + ror) instead of four byte stores
+		t = __builtin_bswap32(t);
+		t = (t >> 8) | (t << 24);
+		memcpy(to, &t, sizeof(t));
+	}
+	else
+	{
+		to[Blue] = (u8)t;
+		to[Green] = (u8)(t >> 8);
+		to[Red] = (u8)(t >> 16);
+		to[Alpha] = (u8)(t >> 24);
+	}
+}
+
 template<int Red = 0, int Green = 1, int Blue = 2, int Alpha = 3>
 class TAParserTempl : public BaseTAParser
 {
@@ -658,14 +678,37 @@ private:
 			vd_rc.fZ_max=z;
 	}
 
+	// Zeroed vertices without a memset call per vertex. Plain core stores: on
+	// Cortex-A9, NEON stores followed by core stores to the same lines stall.
+	static inline void zeroVertex(Vertex *v, u32 from = 0)
+	{
+		static_assert(sizeof(Vertex) % 4 == 0, "Vertex size");
+		volatile u32 *p = (u32 *)v;
+		for (u32 i = from; i < sizeof(Vertex) / 4; i++)
+			p[i] = 0;
+	}
+
+	static Vertex *newVertices(u32 count)
+	{
+		// verts doesn't initialize new elements
+		vd_rc.verts.resize(vd_rc.verts.size() + count);
+		Vertex *v = &vd_rc.verts.back() - (count - 1);
+		for (u32 i = 0; i < count; i++)
+			zeroVertex(v + i);
+		return v;
+	}
+
 		//Poly Vertex handlers
 		//Append vertex base
 	template<class T>
 	static Vertex* vert_cvt_base_(T* vtx)
 	{
 		f32 invW = vtx->xyz[2];
-		vd_rc.verts.emplace_back();
+		vd_rc.verts.emplace_back();	// not initialized
 		Vertex* cv = &vd_rc.verts.back();
+		__builtin_prefetch(cv + 4, 1);
+		// x, y and z are set below
+		zeroVertex(cv, 3);
 		cv->x = vtx->xyz[0];
 		cv->y = vtx->xyz[1];
 		cv->z = invW;
@@ -697,14 +740,7 @@ private:
 		cv->v1 = f16(vtx->v_name);
 
 		//Color conversions
-	#define vert_packed_color_(to,src) \
-		{ \
-		u32 t=src; \
-		to[Blue] = (u8)(t);t>>=8;\
-		to[Green] = (u8)(t);t>>=8;\
-		to[Red] = (u8)(t);t>>=8;\
-		to[Alpha] = (u8)(t);      \
-		}
+	#define vert_packed_color_(to,src) packedColor<Red, Green, Blue, Alpha>(to, src);
 
 	#define vert_float_color_(to,a,r,g,b) \
 		to[Red] = float_to_satu8(r); \
@@ -1005,8 +1041,7 @@ private:
 			return;
         CurrentPP->count = 4;
 
-        vd_rc.verts.resize(vd_rc.verts.size() + 4);
-		Vertex *cv = &vd_rc.verts.back() - 3;
+		Vertex *cv = newVertices(4);
 
 		//Fill static stuff
 		append_sprite(0);
@@ -1541,13 +1576,13 @@ void decode_pvr_vertex(u32 base, u32 ptr, Vertex* cv)
 	//Color
 	u32 col = pvr_read32p<u32>(ptr);
 	ptr += 4;
-	vert_packed_color_(cv->col, col);
+	packedColor<Red, Green, Blue, Alpha>(cv->col, col);
 	if (isp.Offset)
 	{
 		//Intensity color (can be missing too ;p)
 		u32 col = pvr_read32p<u32>(ptr);
 		ptr += 4;
-		vert_packed_color_(cv->spc, col);
+		packedColor<Red, Green, Blue, Alpha>(cv->spc, col);
 	}
 }
 

@@ -23,6 +23,7 @@
 #include "arm7_rec.h"
 #include "rec-ARM/arm_unwind.h"
 #include "oslib/virtmem.h"
+#include "hw/aica/aica_if.h"
 
 #ifdef _M_ARM
 #pragma push_macro("MemoryBarrier")
@@ -328,7 +329,26 @@ static void call(const void *code, bool saveFlags = true)
 		loadFlags();
 }
 
-static void emitMemOp(const ArmOp& op)
+// Whether the host flags (the guest flags) may be read after block_ops[i].
+// Dead only if a following op sets N, Z, C and V before anything reads them.
+static bool flagsLiveAfter(const std::vector<ArmOp>& block_ops, size_t i)
+{
+	for (size_t j = i + 1; j < block_ops.size(); j++)
+	{
+		const ArmOp& op = block_ops[j];
+		if (op.condition != ArmOp::AL || (op.flags & (ArmOp::OP_READS_FLAGS | ArmOp::OP_SETS_PC))
+				|| op.op_type >= ArmOp::B)
+			return true;
+		if ((op.flags & ArmOp::OP_SETS_FLAGS)
+				&& (op.op_type == ArmOp::SUB || op.op_type == ArmOp::RSB || op.op_type == ArmOp::ADD
+						|| op.op_type == ArmOp::CMP || op.op_type == ArmOp::CMN))
+			return false;
+	}
+	// stored to the guest PSR at the end of the block
+	return true;
+}
+
+static void emitMemOp(const ArmOp& op, bool flagsLive)
 {
 	Register addr_reg = loadOperand(op.arg[0], r2);
 	if (op.pre_index)
@@ -373,11 +393,54 @@ static void emitMemOp(const ArmOp& op)
 			ass.Mov(r1, regalloc->map(op.arg[2].getReg().armreg));
 	}
 
+	// Inline access to the sound RAM, same as readMem/writeMem.
+	// The code cache is flushed on reset, after the RAM is (re)mapped.
+	const u32 ramBits = 31 - __builtin_clz(ARAM_SIZE);
+	verify(ARAM_SIZE == 1u << ramBits && ARAM_SIZE <= 0x800000);
+	Label slowPath;
+	Label done;
+	// the host flags are the guest flags
+	if (flagsLive)
+		ass.Mrs(r3, APSR);
+	ass.Tst(r0, 0x800000);
+	ass.B(ne, &slowPath);
+	ass.Mov(ip, (u32)&aica_ram[0]);
+	if (op.byte_xfer)
+	{
+		ass.Ubfx(r2, r0, 0, ramBits);
+		if (op.op_type == ArmOp::LDR)
+			ass.Ldrb(regalloc->map(op.rd.getReg().armreg), MemOperand(ip, r2));
+		else
+			ass.Strb(r1, MemOperand(ip, r2));
+	}
+	else
+	{
+		ass.Ubfx(r2, r0, 2, ramBits - 2);
+		if (op.op_type == ArmOp::LDR)
+		{
+			// unaligned loads are rotated
+			ass.Ldr(r2, MemOperand(ip, r2, LSL, 2));
+			ass.And(r0, r0, 3);
+			ass.Lsl(r0, r0, 3);
+			ass.Ror(regalloc->map(op.rd.getReg().armreg), r2, r0);
+		}
+		else
+		{
+			ass.Str(r1, MemOperand(ip, r2, LSL, 2));
+		}
+	}
+	if (flagsLive)
+		ass.Msr(APSR_nzcvq, r3);
+	ass.B(&done);
+
+	ass.Bind(&slowPath);
+	if (flagsLive)
+		ass.Msr(APSR_nzcvq, r3);
 	call(recompiler::getMemOp(op.op_type == ArmOp::LDR, op.byte_xfer));
 
 	if (op.op_type == ArmOp::LDR)
 		ass.Mov(regalloc->map(op.rd.getReg().armreg), r0);
-
+	ass.Bind(&done);
 }
 
 static void emitBranch(const ArmOp& op)
@@ -457,7 +520,7 @@ void arm7backend_compile(const std::vector<ArmOp>& block_ops, u32 cycles)
 			emitDataProcOp(op);
 		else if (op.op_type <= ArmOp::STR)
 			// memory load/store
-			emitMemOp(op);
+			emitMemOp(op, flagsLiveAfter(block_ops, i));
 		else if (op.op_type <= ArmOp::BL)
 			// branch
 			emitBranch(op);

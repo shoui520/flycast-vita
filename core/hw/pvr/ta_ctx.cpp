@@ -120,6 +120,13 @@ TA_context *tactx_Alloc()
 	if (ctx == nullptr) {
 		ctx = new TA_context();
 		ctx->Alloc();
+#ifdef __vita__
+		// TELEMETRY (temporary)
+		void vita_mem_report(const char *where);
+		static u32 tmCount;
+		WARN_LOG(PVR, "TM new TA context %u", ++tmCount);
+		vita_mem_report("tactx");
+#endif
 	}
 	return ctx;
 }
